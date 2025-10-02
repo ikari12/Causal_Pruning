@@ -7,13 +7,13 @@
 
 # --- Build Command (if needed) ---
 # Uncomment the line below if you need to rebuild the Docker image.
-# docker build -t causal-pruning .
+docker build -t causal-pruning .
 
 # --- Main Execution Command ---
 # This is the primary command to run the experiment.
 docker run \
   --gpus all \
-  -e CUDA_VISIBLE_DEVICES="0" \
+  -e CUDA_VISIBLE_DEVICES="0,1,2,3" \
   -v "$(pwd)/results:/app/results" \
   causal-pruning
 

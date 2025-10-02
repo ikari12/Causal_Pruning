@@ -493,7 +493,8 @@ class CausalImportanceCalculator:
 
         # Step 4: Execute all tasks simultaneously across GPUs.
         #results = Parallel(n_jobs=n_gpus, verbose=50)(tasks)
-        results = Parallel(n_jobs=len(tasks) if len(tasks) < 35 else 35, verbose=50)(tasks)
+        MAXIMUM_PROCESS = len(tasks) / n_gpus if len(tasks) / n_gpus < 30 else 30
+        results = Parallel(n_jobs=MAXIMUM_PROCESS, verbose=50)(tasks)
 
         importance_scores = dict(zip(target_layers, results))
         return importance_scores
