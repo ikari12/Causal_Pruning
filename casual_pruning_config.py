@@ -628,6 +628,15 @@ class WandaWithCausalMasking:
                 hooks.append(hook)
 
         with torch.no_grad():
+            # ==================================================================
+            # Final Correction: Forcibly synchronise devices before this call.
+            # This ensures that even if the model was moved to CPU earlier,
+            # it is moved back to the correct GPU before being called.
+            # ==================================================================
+            target_device = inputs.get('input_ids', next(iter(inputs.values()))).device
+            self.model.to(target_device)
+            # ==================================================================
+            
             self.model(**inputs)
 
         for hook in hooks:
@@ -1022,13 +1031,15 @@ class ComprehensiveValidationFramework:
         self.results = []
         self.evaluator = ComprehensiveEvaluator(config)
         self.importance_cache = {}  # Correction: Add a cache for importance scores.
+        self.cache_dir = Path(self.config.results_dir) / ".importance_cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         torch.manual_seed(config.random_seed)
         np.random.seed(config.random_seed)
         Path(config.results_dir).mkdir(parents=True, exist_ok=True)
 
     def run_comprehensive_validation(self) -> Dict[str, Any]:
         """
-        Run the complete validation with an efficient caching mechanism for
+        Run the complete validation with a file-based caching mechanism for
         importance scores.
         """
         logger.info("Starting comprehensive validation...")
@@ -1045,8 +1056,6 @@ class ComprehensiveValidationFramework:
         
         logger.info(f"Total experiments: {len(all_experiments)}")
         
-        # Correction: Use a robust method to get unique model-dataset pairs
-        # without hashing the objects themselves.
         seen_pairs = set()
         unique_model_dataset_pairs = []
         for model_cfg, data_cfg, _, _, _ in all_experiments:
@@ -1055,49 +1064,55 @@ class ComprehensiveValidationFramework:
                 unique_model_dataset_pairs.append((model_cfg, data_cfg))
                 seen_pairs.add(pair_identifier)
 
-        # Iterate through unique pairs to calculate importance once
         for model_config, dataset_config in unique_model_dataset_pairs:
             cache_key = (model_config.name, dataset_config.name)
-            if cache_key not in self.importance_cache:
-                logger.info(
-                    f"\nCalculating importance scores for {model_config.name} "
-                    f"on {dataset_config.name}..."
-                )
-                
-                temp_model, temp_tokeniser = self._load_model_and_tokeniser(
-                    model_config, dataset_config.task_type
-                )
+            
+            sane_model_name = model_config.name.replace("/", "_")
+            sane_dataset_name = dataset_config.name.replace("/", "_")
+            cache_file = self.cache_dir / f"{sane_model_name}_{sane_dataset_name}.pt"
 
-                calib_dataset = self.evaluator._load_dataset(dataset_config)
-                calib_inputs = self._prepare_calibration_data(
-                    calib_dataset, temp_tokeniser, dataset_config.text_columns
-                )
-                
-                device = next(temp_model.parameters()).device
-                inputs = {k: v.to(device) for k, v in calib_inputs.items()}
+            if cache_file.exists():
+                logger.info(f"Loading cached scores from: {cache_file}")
+                self.importance_cache[cache_key] = torch.load(cache_file)
+                continue 
 
-                causal_calc = CausalImportanceCalculator(
-                    temp_model, temp_tokeniser, device=device
-                )
-                causal_scores = causal_calc.compute_causal_importance(inputs)
-                
-                wanda_pruner = WandaWithCausalMasking(temp_model, causal_calc)
-                wanda_scores = {}
-                activations = wanda_pruner._get_activations(inputs)
-                for name, module in temp_model.named_modules():
-                    if isinstance(module, nn.Linear):
-                        weights = module.weight.data
-                        if name in activations:
-                            acts = activations[name]
-                            wanda_scores[name] = torch.abs(weights) * torch.abs(acts).mean(0)
-                        else:
-                            wanda_scores[name] = torch.abs(weights)
-                
-                self.importance_cache[cache_key] = {
-                    "causal": causal_scores,
-                    "wanda": wanda_scores
-                }
-                del temp_model
+            logger.info(
+                f"\nNo cache found. Calculating scores for {model_config.name} "
+                f"on {dataset_config.name}..."
+            )
+            
+            temp_model, temp_tokeniser = self._load_model_and_tokeniser(
+                model_config, dataset_config.task_type
+            )
+            calib_dataset = self.evaluator._load_dataset(dataset_config)
+            calib_inputs = self._prepare_calibration_data(
+                calib_dataset, temp_tokeniser, dataset_config.text_columns
+            )
+            device = next(temp_model.parameters()).device
+            inputs = {k: v.to(device) for k, v in calib_inputs.items()}
+
+            causal_calc = CausalImportanceCalculator(
+                temp_model, temp_tokeniser, device=device
+            )
+            causal_scores = causal_calc.compute_causal_importance(inputs)
+            
+            wanda_pruner = WandaWithCausalMasking(temp_model, causal_calc)
+            wanda_scores = {}
+            activations = wanda_pruner._get_activations(inputs)
+            for name, module in temp_model.named_modules():
+                if isinstance(module, nn.Linear):
+                    weights = module.weight.data
+                    if name in activations:
+                        acts = activations[name]
+                        wanda_scores[name] = torch.abs(weights) * torch.abs(acts).mean(0)
+                    else:
+                        wanda_scores[name] = torch.abs(weights)
+            
+            scores_to_cache = {"causal": causal_scores, "wanda": wanda_scores}
+            self.importance_cache[cache_key] = scores_to_cache
+            logger.info(f"Saving new scores to: {cache_file}")
+            torch.save(scores_to_cache, cache_file)
+            del temp_model
         
         progress_bar = tqdm(all_experiments, desc="Overall Progress", ncols=80)
         # Now run all experiments using the cached scores
