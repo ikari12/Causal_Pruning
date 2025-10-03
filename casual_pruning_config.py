@@ -8,6 +8,7 @@ pruning with integration of Wanda and SparseGPT methods, evaluated across
 JMTEB and MTEB benchmark datasets.
 """
 # Standard library imports
+import io
 import json
 import logging
 from abc import ABC, abstractmethod
@@ -583,35 +584,44 @@ class WandaWithCausalMasking:
         self.causal_calculator = causal_calculator
 
     def compute_wanda_scores(
-        self, inputs: Dict[str, torch.Tensor], sparsity: float = 0.5
+        self, inputs: Dict[str, torch.Tensor], causal_scores: Dict[str, torch.Tensor], sparsity: float = 0.5
     ) -> Dict[str, torch.Tensor]:
         """Compute Wanda importance scores with causal masking."""
         
-        # Get activations first.
         activations = self._get_activations(inputs)
-
-        # Then, compute the scores based on weights and activations.
         wanda_scores = {}
+
+        # --- ▼▼▼ ADD THIS BLOCK FOR CAUSAL MASKING ▼▼▼ ---
+        # 1. Determine a threshold to identify causally critical modules.
+        # We protect modules with a causal score in the top (1 - sparsity)% percentile.
+        if causal_scores:
+            all_causal_scores = torch.tensor(list(causal_scores.values()))
+            # Protect a slightly larger fraction than the prune ratio for safety
+            protection_quantile = sparsity * 0.8 
+            protection_threshold = torch.quantile(all_causal_scores, protection_quantile)
+        else:
+            protection_threshold = float('inf') # No protection if no scores
+        # --- ▲▲▲ END OF BLOCK ▲▲▲ ---
+
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Linear):
-                weights = module.weight.data.cpu() # Ensure weights are on CPU for consistent calculation
+                weights = module.weight.data.cpu()
+                score = torch.abs(weights) # Default to magnitude if no activations
+
                 if name in activations:
-                    # activations are already per-neuron norms on CPU
                     act_norms = activations[name]
-                    
                     if act_norms.shape[0] == weights.shape[1]:
-                        # Standard case: weight (out, in), act_norm (in,)
                         score = torch.abs(weights) * act_norms.unsqueeze(0)
-                    else:
-                        score = torch.abs(weights) # Fallback
-                else:
-                    score = torch.abs(weights) # Fallback if no activations found
+                
+                # --- ▼▼▼ ADD THIS BLOCK FOR CAUSAL MASKING ▼▼▼ ---
+                # 2. Boost the scores of causally important modules.
+                if name in causal_scores and causal_scores[name] > protection_threshold:
+                    # Multiply by a large factor to make these scores highly unlikely to be pruned.
+                    score *= 10.0 
+                # --- ▲▲▲ END OF BLOCK ▲▲▲ ---
                 
                 wanda_scores[name] = score
 
-        # Causal masking logic (can be applied after score computation)
-        # This part can be refined, but we first fix the activation calculation.
-        # For now, we return the computed wanda scores.
         return wanda_scores
 
     def _get_activations(
@@ -697,91 +707,28 @@ class WandaWithCausalMasking:
         
 
 class SparseGPTWithCausalMasking:
-    """SparseGPT pruning method enhanced with causal masking."""
-
+    """
+    Implements a more faithful, data-driven version of SparseGPT,
+    enhanced with causal masking.
+    """
     def __init__(
         self, model: nn.Module, causal_calculator: CausalImportanceCalculator
     ):
         self.model = model
-        self.causal_calculator = causal_calculator
-
-    def compute_sparsegpt_scores(
-        self, inputs: Dict[str, torch.Tensor], sparsity: float = 0.5
-    ) -> Dict[str, torch.Tensor]:
-        """Compute SparseGPT scores with causal masking."""
-        importance_scores = {}
-        causal_scores = self.causal_calculator.compute_causal_importance(
-            inputs
-        )
-
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.Linear):
-                hessian_diag = self._compute_hessian_diagonal(module, inputs)
-                weights = module.weight.data
-                sparsegpt_scores = weights.pow(2) * hessian_diag
-
-                if name in causal_scores:
-                    causal_mask = causal_scores[name]
-                    protection_threshold = torch.quantile(
-                        causal_mask, 1 - sparsity * 0.3
-                    )
-                    causal_protection = (
-                        causal_mask > protection_threshold
-                    ).float()
-                    sparsegpt_scores *= (1 + causal_protection * 3)
-
-                importance_scores[name] = sparsegpt_scores
-        return importance_scores
-
-    def _compute_hessian_diagonal(
-        self, module: nn.Linear, inputs: Dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        """Compute an approximate Hessian diagonal for the layer."""
-        weights = module.weight.data
-        fisher_diag = torch.ones_like(weights) * 1e-4
-        fisher_diag += torch.abs(weights) * 1e-3
-        return fisher_diag
-
-    def prune_with_causal_masking(
-        self, inputs: Dict[str, torch.Tensor], sparsity: float
-    ) -> nn.Module:
-        """Apply SparseGPT pruning with causal masking."""
-        importance_scores = self.compute_sparsegpt_scores(inputs, sparsity)
-        return self._apply_obs_pruning(importance_scores, sparsity)
-
-    def _apply_obs_pruning(
-        self, importance_scores: Dict[str, torch.Tensor], sparsity: float
-    ) -> nn.Module:
-        """Apply Optimal Brain Surgeon style pruning."""
-        for name, module in self.model.named_modules():
-            if name in importance_scores and isinstance(module, nn.Linear):
-                scores = importance_scores[name]
-                threshold = torch.quantile(scores.flatten(), sparsity)
-                mask = (scores > threshold).float()
-                original_weights = module.weight.data.clone()
-                module.weight.data *= mask
-                pruned_weights = original_weights * (1 - mask)
-
-                if mask.sum() > 0:
-                    redistribution = pruned_weights.sum() / mask.sum()
-                    module.weight.data += mask * redistribution * 0.1
-        return self.model
-
-
-class WandaPruner:
-    """Implements the Wanda pruning method."""
-    def __init__(self, model: nn.Module):
-        self.model = model
+        self.causal_calculator = causal_calculator # Used for causal masking
         self.activations = {}
 
-    def _capture_activations(self, inputs: Dict[str, torch.Tensor]):
-        """Runs a forward pass to capture the input activations for each linear layer."""
+    def _capture_activations(self, inputs: Dict[str, torch.Tensor], batch_size: int = 16):
+        """Captures input activations required to compute the data-driven Hessian."""
         self.activations.clear()
-        
+        device = self.model.device
+
         def hook_fn(name):
-            def hook(module, input, output):
-                if isinstance(input, tuple) and len(input) > 0:
-                    self.activations[name] = input[0].detach()
+            def hook(module, input_val, output):
+                if isinstance(input_val, tuple) and len(input_val) > 0:
+                    if name not in self.activations:
+                        self.activations[name] = []
+                    self.activations[name].append(input_val[0].detach().cpu())
             return hook
 
         hooks = []
@@ -789,69 +736,247 @@ class WandaPruner:
             if isinstance(module, nn.Linear):
                 hooks.append(module.register_forward_hook(hook_fn(name)))
         
-        with torch.no_grad():
-            self.model(**inputs)
+        total_samples = next(iter(inputs.values())).shape[0]
         
+        with torch.no_grad():
+            is_training = self.model.training
+            self.model.eval()
+            for i in range(0, total_samples, batch_size):
+                batch_inputs = {k: v[i:i+batch_size].to(device) for k, v in inputs.items()}
+                self.model(**batch_inputs)
+            if is_training:
+                self.model.train()
+
+        for hook in hooks:
+            hook.remove()
+
+    def compute_sparsegpt_scores(
+        self, inputs: Dict[str, torch.Tensor], causal_scores: Dict[str, torch.Tensor], sparsity: float = 0.5
+    ) -> Dict[str, torch.Tensor]:
+        """Compute SparseGPT importance scores using a data-driven Hessian and causal masking."""
+        logger.info("  -> Applying data-driven SparseGPT-like pruning...")
+        self._capture_activations(inputs)
+        
+        sparsegpt_scores = {}
+
+        if causal_scores:
+            all_causal_scores = torch.tensor(list(causal_scores.values()))
+            protection_quantile = sparsity * 0.8
+            protection_threshold = torch.quantile(all_causal_scores, protection_quantile)
+        else:
+            protection_threshold = float('inf')
+
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear) and name in self.activations:
+                weights = module.weight.data
+                act_list = self.activations[name]
+                
+                if not act_list: continue
+
+                concatenated_acts = torch.cat(act_list, dim=0).to(weights.device)
+                
+                if concatenated_acts.dim() == 3:
+                    reshaped_acts = concatenated_acts.view(-1, concatenated_acts.shape[-1])
+                else:
+                    reshaped_acts = concatenated_acts
+
+                # H is approximated by 2 * X^T*X. The diagonal of X^T*X is sum(X_i^2).
+                H_diag = 2 * torch.sum(reshaped_acts.float().pow(2), dim=0)
+                
+                # Importance score is W^2 / diag(H_inv) ≈ W^2 * diag(H).
+                # Add epsilon for numerical stability.
+                score = weights.pow(2) / (H_diag.unsqueeze(0) + 1e-8)
+                
+                if name in causal_scores and causal_scores[name] > protection_threshold:
+                    score *= 10.0 # Boost score for causal protection
+                
+                sparsegpt_scores[name] = score
+        
+        return sparsegpt_scores
+
+    def prune_with_causal_masking(
+        self, inputs: Dict[str, torch.Tensor], causal_scores: Dict[str, torch.Tensor], sparsity: float
+    ) -> nn.Module:
+        """Apply SparseGPT pruning with causal masking."""
+        importance_scores = self.compute_sparsegpt_scores(inputs, causal_scores, sparsity)
+        
+        # In a full implementation, a complex weight update would happen here.
+        # For this framework, we use simple masking based on the improved scores.
+        for name, module in self.model.named_modules():
+            if name in importance_scores and isinstance(module, nn.Linear):
+                scores = importance_scores[name].to(module.weight.device)
+                threshold = torch.quantile(scores.flatten(), sparsity)
+                mask = (scores > threshold).float()
+                module.weight.data *= mask
+        
+        return self.model
+
+class WandaPruner:
+    """
+    Implements the Wanda pruning method rigorously, following the original paper.
+    Key correction: Uses L2-norm of activations instead of mean of absolute values.
+    """
+    def __init__(self, model: nn.Module):
+        self.model = model
+        self.activations = {}
+
+    def _capture_activations(self, inputs: Dict[str, torch.Tensor], batch_size: int = 16):
+        """
+        Runs a forward pass to capture input activations for each linear layer,
+        processing in batches to conserve memory.
+        """
+        self.activations.clear()
+        
+        def hook_fn(name):
+            def hook(module, input_val, output):
+                if isinstance(input_val, tuple) and len(input_val) > 0:
+                    if name not in self.activations:
+                        self.activations[name] = []
+                    # Store on CPU to avoid accumulating tensors on GPU
+                    self.activations[name].append(input_val[0].detach().cpu())
+            return hook
+
+        hooks = []
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                hooks.append(module.register_forward_hook(hook_fn(name)))
+        
+        total_samples = next(iter(inputs.values())).shape[0]
+        
+        with torch.no_grad():
+            original_training_state = self.model.training
+            self.model.eval()
+            
+            for i in range(0, total_samples, batch_size):
+                batch_inputs = {k: v[i:i+batch_size].to(self.model.device) for k, v in inputs.items()}
+                self.model(**batch_inputs)
+            
+            if original_training_state:
+                self.model.train()
+
         for hook in hooks:
             hook.remove()
 
     def prune(self, inputs: Dict[str, torch.Tensor], sparsity: float) -> nn.Module:
         """Applies Wanda pruning to the model."""
-        logger.info("   -> Applying pure Wanda pruning...")
+        logger.info("  -> Applying rigorous Wanda pruning...")
         self._capture_activations(inputs)
         
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Linear) and name in self.activations:
                 weights = module.weight.data
-                acts = self.activations[name]
-
-                # Handle both 2D and 3D activation tensors
-                if acts.dim() == 3:
-                    act_norms = torch.abs(acts).mean(dim=[0, 1])
-                elif acts.dim() == 2:
-                    act_norms = torch.abs(acts).mean(dim=0)
+                act_list = self.activations[name]
+                
+                if not act_list:
+                    continue
+                
+                # Concatenate all captured activation batches on CPU
+                concatenated_acts = torch.cat(act_list, dim=0)
+                
+                # Reshape activations to (num_tokens, in_features)
+                if concatenated_acts.dim() == 3:
+                    reshaped_acts = concatenated_acts.view(-1, concatenated_acts.shape[-1])
                 else:
-                    continue # Skip if activation format is unexpected
-
-                if act_norms.shape[0] != weights.shape[1]:
-                    continue # Skip if dimensions don't align
-
-                scores = torch.abs(weights) * act_norms
+                    reshaped_acts = concatenated_acts
+                
+                # Calculate the L2 norm for each input neuron across all tokens.
+                act_norms = torch.linalg.norm(reshaped_acts.float(), ord=2, dim=0).to(weights.device)
+                
+                # Calculate importance scores: |W| * ||X||
+                scores = torch.abs(weights) * act_norms.unsqueeze(0) # unsqueeze for broadcasting
+                
+                # Determine threshold and create mask
                 threshold = torch.quantile(scores.flatten(), sparsity)
                 mask = (scores > threshold).float()
+                
+                # Apply the mask to prune weights
                 module.weight.data *= mask
+                
         return self.model
 
-
 class SparseGPTPruner:
-    """Implements a simplified SparseGPT-like pruning method."""
+    """
+    Implements a more faithful, data-driven version of SparseGPT.
+    Key correction: Computes an approximate Hessian diagonal from actual
+    calibration data (X^T * X), rather than using a dummy value.
+    """
     def __init__(self, model: nn.Module):
         self.model = model
+        self.activations = {}
 
-    def _compute_hessian_approx(self, weights: torch.Tensor) -> torch.Tensor:
-        """Computes a simplified diagonal Hessian approximation."""
-        return torch.ones_like(weights) * 1e-4 + torch.abs(weights) * 1e-3
+    def _capture_activations(self, inputs: Dict[str, torch.Tensor], batch_size: int = 16):
+        """
+        Captures input activations, similar to the Wanda pruner.
+        This is necessary to compute the data-driven Hessian.
+        """
+        self.activations.clear()
+        
+        def hook_fn(name):
+            def hook(module, input_val, output):
+                if isinstance(input_val, tuple) and len(input_val) > 0:
+                    if name not in self.activations:
+                        self.activations[name] = []
+                    self.activations[name].append(input_val[0].detach().cpu())
+            return hook
 
-    def prune(self, sparsity: float) -> nn.Module:
-        """Applies SparseGPT-like pruning to the model."""
-        logger.info("   -> Applying pure SparseGPT pruning...")
+        hooks = []
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Linear):
+                hooks.append(module.register_forward_hook(hook_fn(name)))
+
+        total_samples = next(iter(inputs.values())).shape[0]
+        
+        with torch.no_grad():
+            original_training_state = self.model.training
+            self.model.eval()
+
+            for i in range(0, total_samples, batch_size):
+                batch_inputs = {k: v[i:i+batch_size].to(self.model.device) for k, v in inputs.items()}
+                self.model(**batch_inputs)
+
+            if original_training_state:
+                self.model.train()
+
+        for hook in hooks:
+            hook.remove()
+
+    def prune(self, inputs: Dict[str, torch.Tensor], sparsity: float) -> nn.Module:
+        """Applies a more rigorous SparseGPT-like pruning to the model."""
+        logger.info("  -> Applying data-driven SparseGPT-like pruning...")
+        # SparseGPT requires calibration data to compute the Hessian.
+        self._capture_activations(inputs)
+        
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear) and name in self.activations:
                 weights = module.weight.data
-                hessian_diag = self._compute_hessian_approx(weights)
+                act_list = self.activations[name]
                 
-                scores = weights.pow(2) * hessian_diag
+                if not act_list:
+                    continue
+
+                concatenated_acts = torch.cat(act_list, dim=0).to(weights.device)
+                
+                if concatenated_acts.dim() == 3:
+                    reshaped_acts = concatenated_acts.view(-1, concatenated_acts.shape[-1])
+                else:
+                    reshaped_acts = concatenated_acts
+
+                # The Hessian H is approximated by 2 * X^T*X. We need its inverse diagonal.
+                # The diagonal of X^T*X is sum(X_i^2) for each feature i.
+                H_diag = 2 * torch.sum(reshaped_acts.float().pow(2), dim=0)
+                
+                # The importance score is W^2 / diag(H_inv), which is approx. W^2 * diag(H).
+                scores = weights.pow(2) * H_diag.unsqueeze(0)
+                
+                # Mask and prune
                 threshold = torch.quantile(scores.flatten(), sparsity)
                 mask = (scores > threshold).float()
-                
-                # Apply mask and perform a simple weight update (OBS-style)
-                original_weights = weights.clone()
                 module.weight.data *= mask
-                pruned_weights = original_weights * (1 - mask)
 
-                if mask.sum() > 0:
-                    redistribution = pruned_weights.sum() / mask.sum()
-                    module.weight.data += mask * redistribution * 0.1
+                # Note: A full SparseGPT implementation includes a complex weight update step here
+                # using the off-diagonal Hessian information. This is omitted for simplicity
+                # but the core importance scoring is now correctly data-driven.
+
         return self.model
     
 
@@ -1310,7 +1435,26 @@ class ComprehensiveValidationFramework:
         logger.info("Comprehensive validation completed!")
         return final_results
                 
-                    
+
+    def _report_model_size(self, model: nn.Module, description: str):
+        """Calculates and logs the model's size and parameter count."""
+        total_params = sum(p.numel() for p in model.parameters())
+        nonzero_params = sum(p.nonzero().size(0) for p in model.parameters())
+        
+        # Calculate size in MB by saving to a temporary buffer
+        buffer = io.BytesIO()
+        torch.save(model.state_dict(), buffer)
+        size_mb = buffer.getbuffer().nbytes / 1e6
+
+        sparsity = (1 - (nonzero_params / total_params)) * 100
+
+        logger.info(f"    -> {description}:")
+        logger.info(f"       Model Size: {size_mb:.2f} MB")
+        logger.info(f"       Total Params: {total_params:,}")
+        logger.info(f"       Non-Zero Params: {nonzero_params:,} ({100-sparsity:.1f}%)")
+        logger.info(f"       Sparsity: {sparsity:.2f}%")
+
+
     def _run_single_experiment(
         self,
         model_config: ModelConfig,
@@ -1330,6 +1474,9 @@ class ComprehensiveValidationFramework:
                 model_config, dataset_config.task_type
             )
             if sparsity > 0:
+                self._report_model_size(model, "Original Model")
+
+            if sparsity > 0:
                 calib_dataset = self.evaluator._load_dataset(dataset_config)
                 calib_inputs = self._prepare_calibration_data(
                     calib_dataset, tokeniser, dataset_config.text_columns
@@ -1337,6 +1484,7 @@ class ComprehensiveValidationFramework:
                 model = self._apply_pruning(
                     model, tokeniser, pruning_config, sparsity, calib_inputs
                 )
+                self._report_model_size(model, f"Pruned Model ({pruning_config.method_name} @ {sparsity*100:.0f}%)")
             
             eval_results = self.evaluator.evaluate_model_on_dataset(
                 model, tokeniser, dataset_config, pruning_config
@@ -1465,8 +1613,13 @@ class ComprehensiveValidationFramework:
             return pruner.prune(inputs, sparsity)
         
         elif method == "CausalMaskedWanda":
-            return self._apply_causal_wanda_from_scores(pruned_model, sparsity, causal_scores, wanda_scores)
-
+            # Create the pruner instance
+            wanda_pruner = WandaWithCausalMasking(pruned_model, None) # Causal calculator not directly needed here
+            # Compute scores with causal scores passed in
+            scores = wanda_pruner.compute_wanda_scores(inputs, causal_scores, sparsity)
+            # Apply pruning using the computed hybrid scores
+            return wanda_pruner._apply_structured_pruning(scores, sparsity)
+        
         elif method == "Magnitude":
             logger.info("   -> Applying Magnitude pruning...")
             for _, module in pruned_model.named_modules():
@@ -1476,12 +1629,37 @@ class ComprehensiveValidationFramework:
                     module.weight.data *= (scores > threshold).float()
             return pruned_model
         
+        elif method == "Causal":
+            logger.info("  -> Applying pure Causal pruning...")
+            
+            if not causal_scores:
+                logger.warning("Causal scores not found. Returning original model.")
+                return model
+            
+            # 1. Gather all scores to determine a global threshold.
+            all_scores = torch.tensor(list(causal_scores.values()))
+            
+            # 2. Find the threshold score based on the desired sparsity.
+            threshold = torch.quantile(all_scores, sparsity)
+
+            # 3. Iterate through the model and prune layers below the threshold.
+            for name, module in pruned_model.named_modules():
+                if name in causal_scores:
+                    if causal_scores[name] < threshold:
+                        # Prune this module by zeroing out its weights.
+                        if hasattr(module, 'weight') and module.weight is not None:
+                            module.weight.data.zero_()
+                        if hasattr(module, 'bias') and module.bias is not None:
+                            module.bias.data.zero_()
+            
+            return pruned_model
+                
         # --- Methods requiring ON-THE-FLY COMPUTATION ---
         elif method == "SparseGPT":
-            # Use the new SparseGPTPruner class
             pruner = SparseGPTPruner(pruned_model)
-            return pruner.prune(sparsity)
-            
+            # Pass the calibration inputs to the prune method
+            return pruner.prune(inputs, sparsity)
+
         elif method == "Gradient":
             return self._apply_gradient_pruning(pruned_model, tokeniser, inputs, sparsity, device)
             
