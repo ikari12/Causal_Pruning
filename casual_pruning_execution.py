@@ -13,6 +13,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import Any, Dict
+import shutil
 
 # Third-party imports
 import pandas as pd
@@ -62,50 +63,48 @@ def create_demo_config() -> ExperimentConfig:
             metric="pearson",
             text_columns=["sentence1", "sentence2"],
             label_column="label",
-            num_samples=100
         ),
         DatasetConfig(
             name="JMTEB-JQaRA-Retrieval",
             dataset_path="sbintuitions/JMTEB",
-            subset="jqara",
+            subset="jqara-query",
             task_type="retrieval",
             metric="ndcg_at_10",
             text_columns=["query", "positive", "negative"],
             label_column="label",
-            num_samples=100
         ),
     ]
     # Correction: Add pure 'Wanda' and 'SparseGPT' to the list.
     pruning_configs = [
-        #PruningConfig(
-        #    method_name="Causal",
-        #    sparsity_levels=[0.0, 0.4, 0.8]
-        #),
+        PruningConfig(
+            method_name="Causal",
+            sparsity_levels=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        ),
         PruningConfig(
             method_name="Wanda",
-            sparsity_levels=[0.0, 0.4, 0.8]
+            sparsity_levels=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         ),
         PruningConfig(
             method_name="CausalMaskedWanda",
-            sparsity_levels=[0.0, 0.4, 0.8],
+            sparsity_levels=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
             causal_masking=True
         ),
         PruningConfig(
             method_name="SparseGPT",
-            sparsity_levels=[0.0, 0.4, 0.8]
+            sparsity_levels=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         ),
         PruningConfig(
             method_name="CausalMaskedSparseGPT",
-            sparsity_levels=[0.0, 0.4, 0.8],
+            sparsity_levels=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
             causal_masking=True
         ),
         PruningConfig(
             method_name="Gradient",
-            sparsity_levels=[0.0, 0.4, 0.8]
+            sparsity_levels=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         ),
         PruningConfig(
             method_name="Magnitude",
-            sparsity_levels=[0.0, 0.4, 0.8]
+            sparsity_levels=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         ),
     ]
     return ExperimentConfig(
@@ -116,7 +115,7 @@ def create_demo_config() -> ExperimentConfig:
         num_runs=2,
         statistical_test="wilcoxon",
         significance_level=0.05,
-        results_dir="demo_ruri_all_methods_results",
+        results_dir="/app/results",
         save_intermediate=True
     )
 
@@ -370,6 +369,10 @@ def main():
         "--resume", type=str,
         help="Resume from an intermediate results directory"
     )
+    parser.add_argument(
+        "--clear-cache", action="store_true",
+        help="Delete the importance score cache before running"
+    )
     args = parser.parse_args()
 
     if args.template:
@@ -394,6 +397,14 @@ def main():
         sys.exit(1)
 
     print_configuration_summary(config)
+
+    if args.clear_cache:
+        cache_dir = Path(config.results_dir) / "importance_cache"
+        if cache_dir.exists():
+            logger.info(f"Clearing cache directory: {cache_dir}")
+            shutil.rmtree(cache_dir)
+        else:
+            logger.info("Cache directory not found, nothing to clear.")
 
     if args.dry_run:
         logger.info("Dry run completed. No experiments were run.")

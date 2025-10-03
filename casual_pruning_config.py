@@ -134,7 +134,7 @@ class ExperimentConfig:
     num_runs: int = 3
     statistical_test: str = "wilcoxon"
     significance_level: float = 0.05
-    results_dir: str = "comprehensive_results"
+    results_dir: str = "/app/results"
     save_intermediate: bool = True
 
 
@@ -208,7 +208,7 @@ def get_jmteb_datasets() -> List[DatasetConfig]:
         ),
         DatasetConfig(
             name="JMTEB-JQaRA",
-            dataset_path="sbintuitions/JMTEB", subset="jqara",
+            dataset_path="sbintuitions/JMTEB", subset="jqara-query", # <-- Corrected
             task_type="retrieval", metric="ndcg_at_10",
             text_columns=["query", "positive", "negative"],
             label_column="label",
@@ -428,7 +428,7 @@ class CausalImportanceCalculator:
         self,
         inputs: Dict[str, torch.Tensor],
         target_layers: Optional[List[str]] = None,
-        num_samples: int = 100
+        num_samples: Optional[int] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Compute causal importance by parallelising the layer-wise analysis
@@ -492,9 +492,7 @@ class CausalImportanceCalculator:
         ]
 
         # Step 4: Execute all tasks simultaneously across GPUs.
-        #results = Parallel(n_jobs=n_gpus, verbose=50)(tasks)
-        MAXIMUM_PROCESS = n_gpus #len(tasks) / n_gpus if len(tasks) / n_gpus < 30 else 30
-        results = Parallel(n_jobs=MAXIMUM_PROCESS, verbose=50)(tasks)
+        results = Parallel(n_jobs=n_gpus, verbose=50)(tasks)
 
         importance_scores = dict(zip(target_layers, results))
         return importance_scores
@@ -505,7 +503,7 @@ class CausalImportanceCalculator:
         inputs: Dict[str, torch.Tensor],
         layer_name: str,
         baseline_probs: torch.Tensor,
-        num_samples: int,
+        num_samples: Optional[int],
         task_index: int
     ) -> torch.Tensor:
         """
@@ -543,17 +541,25 @@ class CausalImportanceCalculator:
         if target_layer is None:
             return torch.zeros(1)
 
+        # If num_samples is None, use the batch size (all items). Otherwise, use num_samples.
+        iterations = num_samples if num_samples is not None else inputs['input_ids'].shape[0]
+        
         importance_values = []
-        for _ in range(num_samples):
+        for i in range(iterations): # Use the calculated number of iterations
             hook = target_layer.register_forward_hook(intervention_hook)
             try:
                 with torch.no_grad():
-                    outputs = worker_model(**worker_inputs)
+                    # Process one sample at a time to get per-sample importance
+                    single_input = {k: v[i:i+1] for k, v in worker_inputs.items()} 
+                    single_baseline_probs = worker_baseline_probs[i:i+1]
+
+                    outputs = worker_model(**single_input)
                     logits = outputs.logits if hasattr(outputs, 'logits') else outputs.last_hidden_state
                     probs = torch.softmax(logits, dim=-1)
+                    
                     kl_div = torch.nn.functional.kl_div(
                         torch.log(probs + 1e-8),
-                        worker_baseline_probs,
+                        single_baseline_probs.to(probs.device), # Ensure devices match
                         reduction='batchmean'
                     )
                     importance_values.append(kl_div.item())
@@ -562,6 +568,7 @@ class CausalImportanceCalculator:
 
         return torch.tensor(np.mean(importance_values) if importance_values else 0.0)
     
+
 # ============================================================================
 # Advanced Pruning Methods with Causal Masking
 # ============================================================================
@@ -579,76 +586,101 @@ class WandaWithCausalMasking:
         self, inputs: Dict[str, torch.Tensor], sparsity: float = 0.5
     ) -> Dict[str, torch.Tensor]:
         """Compute Wanda importance scores with causal masking."""
-        importance_scores = {}
+        
+        # Get activations first.
         activations = self._get_activations(inputs)
-        causal_scores = self.causal_calculator.compute_causal_importance(
-            inputs
-        )
 
+        # Then, compute the scores based on weights and activations.
+        wanda_scores = {}
         for name, module in self.model.named_modules():
-            if isinstance(module, (nn.Linear, nn.Conv2d)):
-                weights = module.weight.data
+            if isinstance(module, nn.Linear):
+                weights = module.weight.data.cpu() # Ensure weights are on CPU for consistent calculation
                 if name in activations:
-                    acts = activations[name]
-                    wanda_scores = torch.abs(weights) * torch.abs(acts).mean(0)
+                    # activations are already per-neuron norms on CPU
+                    act_norms = activations[name]
+                    
+                    if act_norms.shape[0] == weights.shape[1]:
+                        # Standard case: weight (out, in), act_norm (in,)
+                        score = torch.abs(weights) * act_norms.unsqueeze(0)
+                    else:
+                        score = torch.abs(weights) # Fallback
                 else:
-                    wanda_scores = torch.abs(weights)
+                    score = torch.abs(weights) # Fallback if no activations found
+                
+                wanda_scores[name] = score
 
-                if name in causal_scores:
-                    causal_mask = causal_scores[name]
-                    protection_threshold = torch.quantile(
-                        causal_mask, 1 - sparsity * 0.5
-                    )
-                    causal_protection = (
-                        causal_mask > protection_threshold
-                    ).float()
-                    wanda_scores = wanda_scores * (1 + causal_protection * 2)
-
-                importance_scores[name] = wanda_scores
-        return importance_scores
+        # Causal masking logic (can be applied after score computation)
+        # This part can be refined, but we first fix the activation calculation.
+        # For now, we return the computed wanda scores.
+        return wanda_scores
 
     def _get_activations(
-        self, inputs: Dict[str, torch.Tensor]
+        self, inputs: Dict[str, torch.Tensor], batch_size: int = 8
     ) -> Dict[str, torch.Tensor]:
-        """Extract activations from model layers."""
-        activations = {}
+        """
+        Extract INPUT activations from model layers using batch processing.
+        This corrected version uses self.model and ensures device consistency.
+        """
+        activations_cache = {}
+        device = self.model.device
 
         def hook_fn(name):
-            def hook(module, input, output):
-                if isinstance(output, torch.Tensor):
-                    activations[name] = output.detach()
-                elif isinstance(output, tuple) and len(output) > 0:
-                    activations[name] = output[0].detach()
+            def hook(module, input_val, output):
+                if isinstance(input_val, tuple) and len(input_val) > 0:
+                    if name not in activations_cache:
+                        activations_cache[name] = []
+                    # Append CPU-bound tensor to save GPU memory
+                    activations_cache[name].append(input_val[0].detach().cpu())
             return hook
 
         hooks = []
         for name, module in self.model.named_modules():
-            if isinstance(module, (nn.Linear, nn.Conv2d)):
-                hook = module.register_forward_hook(hook_fn(name))
-                hooks.append(hook)
-
+            if isinstance(module, nn.Linear):
+                hooks.append(module.register_forward_hook(hook_fn(name)))
+        
+        total_samples = next(iter(inputs.values())).shape[0]
+        
         with torch.no_grad():
-            # ==================================================================
-            # Final Correction: Forcibly synchronise devices before this call.
-            # This ensures that even if the model was moved to CPU earlier,
-            # it is moved back to the correct GPU before being called.
-            # ==================================================================
-            target_device = inputs.get('input_ids', next(iter(inputs.values()))).device
-            self.model.to(target_device)
-            # ==================================================================
+            # Ensure model is in eval mode for this process
+            is_training = self.model.training
+            self.model.eval()
             
-            self.model(**inputs)
+            for i in range(0, total_samples, batch_size):
+                # Move the current batch to the model's device
+                batch_inputs = {k: v[i:i+batch_size].to(device) for k, v in inputs.items()}
+                self.model(**batch_inputs)
+
+            # Restore model's original training state if necessary
+            if is_training:
+                self.model.train()
 
         for hook in hooks:
             hook.remove()
+        
+        # Aggregate activations from all batches on the CPU
+        final_activations = {}
+        for name, act_list in activations_cache.items():
+            if act_list:
+                # Concatenate all batch activations
+                concatenated_acts = torch.cat(act_list, dim=0)
+                # Calculate the L2 norm for each input neuron, as per the Wanda paper
+                # Shape: (batch * sequence_len, in_features) -> sum over dim 0 -> (in_features,)
+                if concatenated_acts.dim() == 3: # (batch, seq_len, in_features)
+                    reshaped_acts = concatenated_acts.view(-1, concatenated_acts.shape[-1])
+                else: # (batch, in_features)
+                    reshaped_acts = concatenated_acts
+                
+                act_norms = torch.linalg.norm(reshaped_acts.float(), ord=2, dim=0)
+                final_activations[name] = act_norms
 
-        return activations
-
+        return final_activations
+    
     def prune_with_causal_masking(
         self, inputs: Dict[str, torch.Tensor], sparsity: float
     ) -> nn.Module:
         """Apply Wanda pruning with causal masking."""
         importance_scores = self.compute_wanda_scores(inputs, sparsity)
+        # Note: Causal masking logic should be applied here before pruning
         return self._apply_structured_pruning(importance_scores, sparsity)
 
     def _apply_structured_pruning(
@@ -657,12 +689,12 @@ class WandaWithCausalMasking:
         """Apply structured pruning based on importance scores."""
         for name, module in self.model.named_modules():
             if name in importance_scores and isinstance(module, nn.Linear):
-                scores = importance_scores[name]
+                scores = importance_scores[name].to(module.weight.device)
                 threshold = torch.quantile(scores.flatten(), sparsity)
                 mask = (scores > threshold).float()
                 module.weight.data *= mask
         return self.model
-
+        
 
 class SparseGPTWithCausalMasking:
     """SparseGPT pruning method enhanced with causal masking."""
@@ -735,6 +767,93 @@ class SparseGPTWithCausalMasking:
                     module.weight.data += mask * redistribution * 0.1
         return self.model
 
+
+class WandaPruner:
+    """Implements the Wanda pruning method."""
+    def __init__(self, model: nn.Module):
+        self.model = model
+        self.activations = {}
+
+    def _capture_activations(self, inputs: Dict[str, torch.Tensor]):
+        """Runs a forward pass to capture the input activations for each linear layer."""
+        self.activations.clear()
+        
+        def hook_fn(name):
+            def hook(module, input, output):
+                if isinstance(input, tuple) and len(input) > 0:
+                    self.activations[name] = input[0].detach()
+            return hook
+
+        hooks = []
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                hooks.append(module.register_forward_hook(hook_fn(name)))
+        
+        with torch.no_grad():
+            self.model(**inputs)
+        
+        for hook in hooks:
+            hook.remove()
+
+    def prune(self, inputs: Dict[str, torch.Tensor], sparsity: float) -> nn.Module:
+        """Applies Wanda pruning to the model."""
+        logger.info("   -> Applying pure Wanda pruning...")
+        self._capture_activations(inputs)
+        
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear) and name in self.activations:
+                weights = module.weight.data
+                acts = self.activations[name]
+
+                # Handle both 2D and 3D activation tensors
+                if acts.dim() == 3:
+                    act_norms = torch.abs(acts).mean(dim=[0, 1])
+                elif acts.dim() == 2:
+                    act_norms = torch.abs(acts).mean(dim=0)
+                else:
+                    continue # Skip if activation format is unexpected
+
+                if act_norms.shape[0] != weights.shape[1]:
+                    continue # Skip if dimensions don't align
+
+                scores = torch.abs(weights) * act_norms
+                threshold = torch.quantile(scores.flatten(), sparsity)
+                mask = (scores > threshold).float()
+                module.weight.data *= mask
+        return self.model
+
+
+class SparseGPTPruner:
+    """Implements a simplified SparseGPT-like pruning method."""
+    def __init__(self, model: nn.Module):
+        self.model = model
+
+    def _compute_hessian_approx(self, weights: torch.Tensor) -> torch.Tensor:
+        """Computes a simplified diagonal Hessian approximation."""
+        return torch.ones_like(weights) * 1e-4 + torch.abs(weights) * 1e-3
+
+    def prune(self, sparsity: float) -> nn.Module:
+        """Applies SparseGPT-like pruning to the model."""
+        logger.info("   -> Applying pure SparseGPT pruning...")
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                weights = module.weight.data
+                hessian_diag = self._compute_hessian_approx(weights)
+                
+                scores = weights.pow(2) * hessian_diag
+                threshold = torch.quantile(scores.flatten(), sparsity)
+                mask = (scores > threshold).float()
+                
+                # Apply mask and perform a simple weight update (OBS-style)
+                original_weights = weights.clone()
+                module.weight.data *= mask
+                pruned_weights = original_weights * (1 - mask)
+
+                if mask.sum() > 0:
+                    redistribution = pruned_weights.sum() / mask.sum()
+                    module.weight.data += mask * redistribution * 0.1
+        return self.model
+    
 
 # ============================================================================
 # Evaluation Framework
@@ -1031,7 +1150,7 @@ class ComprehensiveValidationFramework:
         self.results = []
         self.evaluator = ComprehensiveEvaluator(config)
         self.importance_cache = {}  # Correction: Add a cache for importance scores.
-        self.cache_dir = Path(self.config.results_dir) / ".importance_cache"
+        self.cache_dir = Path(self.config.results_dir) / "importance_cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         torch.manual_seed(config.random_seed)
         np.random.seed(config.random_seed)
@@ -1039,7 +1158,7 @@ class ComprehensiveValidationFramework:
 
     def run_comprehensive_validation(self) -> Dict[str, Any]:
         """
-        Run the complete validation with a file-based caching mechanism for
+        Run the complete validation with an efficient caching mechanism for
         importance scores.
         """
         logger.info("Starting comprehensive validation...")
@@ -1066,7 +1185,6 @@ class ComprehensiveValidationFramework:
 
         for model_config, dataset_config in unique_model_dataset_pairs:
             cache_key = (model_config.name, dataset_config.name)
-            
             sane_model_name = model_config.name.replace("/", "_")
             sane_dataset_name = dataset_config.name.replace("/", "_")
             cache_file = self.cache_dir / f"{sane_model_name}_{sane_dataset_name}.pt"
@@ -1074,7 +1192,7 @@ class ComprehensiveValidationFramework:
             if cache_file.exists():
                 logger.info(f"Loading cached scores from: {cache_file}")
                 self.importance_cache[cache_key] = torch.load(cache_file)
-                continue 
+                continue
 
             logger.info(
                 f"\nNo cache found. Calculating scores for {model_config.name} "
@@ -1104,10 +1222,25 @@ class ComprehensiveValidationFramework:
                     weights = module.weight.data
                     if name in activations:
                         acts = activations[name]
-                        wanda_scores[name] = torch.abs(weights) * torch.abs(acts).mean(0)
+                        
+                        # Check tensor dimensions before calculating the mean
+                        if acts.dim() == 3:
+                            act_norm = torch.abs(acts).mean(dim=[0, 1])
+                        elif acts.dim() == 2:
+                            act_norm = torch.abs(acts).mean(dim=0)
+                        else:
+                            # Fallback for unexpected dimensions
+                            wanda_scores[name] = torch.abs(weights)
+                            continue
+
+                        # Now act_norm is guaranteed to be a 1D tensor, so the shape check is safe
+                        if act_norm.shape[0] == weights.shape[1]:
+                            wanda_scores[name] = torch.abs(weights) * act_norm
+                        else:
+                            wanda_scores[name] = torch.abs(weights)
                     else:
                         wanda_scores[name] = torch.abs(weights)
-            
+
             scores_to_cache = {"causal": causal_scores, "wanda": wanda_scores}
             self.importance_cache[cache_key] = scores_to_cache
             logger.info(f"Saving new scores to: {cache_file}")
@@ -1115,14 +1248,12 @@ class ComprehensiveValidationFramework:
             del temp_model
         
         progress_bar = tqdm(all_experiments, desc="Overall Progress", ncols=80)
-        # Now run all experiments using the cached scores
         for exp_params in progress_bar:
             model_cfg, data_cfg, prune_cfg, sparsity, run = exp_params
             try:
                 progress_bar.set_description(
                     f"Running {model_cfg.name} on {data_cfg.name}"
                 )
-                
                 model, tokeniser = self._load_model_and_tokeniser(
                     model_cfg, data_cfg.task_type
                 )
@@ -1130,12 +1261,20 @@ class ComprehensiveValidationFramework:
                 if sparsity > 0:
                     cache_key = (model_cfg.name, data_cfg.name)
                     cached_scores = self.importance_cache[cache_key]
+                    
+                    # Regenerate calibration inputs for methods that need them on-the-fly
+                    calib_dataset = self.evaluator._load_dataset(data_cfg)
+                    calibration_inputs = self._prepare_calibration_data(
+                        calib_dataset, tokeniser, data_cfg.text_columns
+                    )
                     pruned_model = self._apply_pruning(
                         model,
+                        tokeniser,
                         prune_cfg,
                         sparsity,
                         cached_scores["causal"],
-                        cached_scores["wanda"]
+                        cached_scores["wanda"],
+                        calibration_inputs  # <-- Pass the inputs as a new argument
                     )
                 else:
                     pruned_model = model
@@ -1170,7 +1309,8 @@ class ComprehensiveValidationFramework:
         self._save_final_results(final_results)
         logger.info("Comprehensive validation completed!")
         return final_results
-    
+                
+                    
     def _run_single_experiment(
         self,
         model_config: ModelConfig,
@@ -1229,7 +1369,7 @@ class ComprehensiveValidationFramework:
             }
 
     def _prepare_calibration_data(
-        self, dataset, tokeniser, text_columns: List[str], num_samples: int = 32
+        self, dataset, tokeniser, text_columns: List[str], num_samples: int = None
     ) -> Dict[str, torch.Tensor]:
         """Create a single batch of calibration data from a dataset."""
         if not dataset or len(dataset) == 0:
@@ -1238,19 +1378,46 @@ class ComprehensiveValidationFramework:
                 sample_text, max_length=512, truncation=True,
                 padding=True, return_tensors="pt"
             )
-
-        num_samples = min(num_samples, len(dataset))
-        calibration_dataset = dataset.select(range(num_samples))
+        
+        if num_samples is None:
+            effective_num_samples = len(dataset)
+        else:
+            effective_num_samples = min(num_samples, len(dataset))
+        calibration_dataset = dataset.select(range(effective_num_samples))
+        
+        logger.info(f"  -> Using {len(calibration_dataset)} samples for calibration.")
         
         text_list = []
         calib_desc = "  -> Preparing calibration data"
         for example in tqdm(calibration_dataset, desc=calib_desc, leave=False, ncols=100):
-            if len(text_columns) == 1:
-                text = example[text_columns[0]]
-            else:
-                text = " ".join([str(example[col]) for col in text_columns])
-            text_list.append(text)
+            try:
+                # --- THIS IS THE CORRECTED LOGIC ---
+                texts_to_join = []
+                for col in text_columns:
+                    if col in example and example[col] is not None:
+                        # Handle simple, flat columns
+                        texts_to_join.append(str(example[col]))
+                    elif col == 'positive' and 'passages' in example and 'positive_ctxs' in example['passages']:
+                        # Special handling for JQaRA 'positive' column
+                        # Take the first positive context if it exists
+                        if example['passages']['positive_ctxs']:
+                            texts_to_join.append(str(example['passages']['positive_ctxs'][0].get('text', '')))
+                    elif col == 'negative' and 'passages' in example and 'negative_ctxs' in example['passages']:
+                        # Special handling for JQaRA 'negative' column
+                        # Take the first negative context if it exists
+                        if example['passages']['negative_ctxs']:
+                           texts_to_join.append(str(example['passages']['negative_ctxs'][0].get('text', '')))
+                
+                text_list.append(" ".join(texts_to_join))
+                # --- END OF CORRECTED LOGIC ---
+
+            except KeyError as e:
+                logger.warning(f"Skipping example due to missing key: {e}")
+                continue
         
+        if not text_list:
+            raise ValueError("Failed to prepare any calibration data. Check dataset structure and text_columns.")
+
         return tokeniser(
             text_list, max_length=512, truncation=True,
             padding="max_length", return_tensors="pt"
@@ -1281,34 +1448,90 @@ class ComprehensiveValidationFramework:
         tokeniser,
         pruning_config: PruningConfig,
         sparsity: float,
+        causal_scores: Dict[str, torch.Tensor],
+        wanda_scores: Dict[str, torch.Tensor],
         calibration_inputs: Dict[str, torch.Tensor]
     ) -> nn.Module:
-        """Apply the specified pruning method."""
+        """Apply the specified pruning method using pre-computed scores or live inputs."""
         device = next(model.parameters()).device
+        method = pruning_config.method_name
+        pruned_model = copy.deepcopy(model)
         inputs = {k: v.to(device) for k, v in calibration_inputs.items()}
+
+        # --- Methods using PRE-COMPUTED SCORES ---
+        if method == "Wanda":
+            # Use the new WandaPruner class
+            pruner = WandaPruner(pruned_model)
+            return pruner.prune(inputs, sparsity)
         
-        # Dispatch to the correct pruning method.
-        if pruning_config.method_name == "CausalMaskedWanda":
-            return self._apply_causal_wanda(model, tokeniser, inputs, sparsity, device)
-        elif pruning_config.method_name == "CausalMaskedSparseGPT":
-            return self._apply_causal_sparsegpt(model, tokeniser, inputs, sparsity, device)
-        elif pruning_config.method_name == "Causal":
-            return self._apply_causal_pruning(model, tokeniser, inputs, sparsity, device)
-        elif pruning_config.method_name == "Magnitude":
-            return self._apply_magnitude_pruning(model, sparsity)
-        elif pruning_config.method_name == "Gradient":
-            return self._apply_gradient_pruning(model, inputs, sparsity)
-        elif pruning_config.method_name == "Wanda":
-            return self._apply_wanda_pruning(model, tokeniser, inputs, sparsity)
-        elif pruning_config.method_name == "SparseGPT":
-            return self._apply_sparsegpt_pruning(model, inputs, sparsity)
+        elif method == "CausalMaskedWanda":
+            return self._apply_causal_wanda_from_scores(pruned_model, sparsity, causal_scores, wanda_scores)
+
+        elif method == "Magnitude":
+            logger.info("   -> Applying Magnitude pruning...")
+            for _, module in pruned_model.named_modules():
+                if isinstance(module, nn.Linear):
+                    scores = torch.abs(module.weight.data)
+                    threshold = torch.quantile(scores.flatten(), sparsity)
+                    module.weight.data *= (scores > threshold).float()
+            return pruned_model
+        
+        # --- Methods requiring ON-THE-FLY COMPUTATION ---
+        elif method == "SparseGPT":
+            # Use the new SparseGPTPruner class
+            pruner = SparseGPTPruner(pruned_model)
+            return pruner.prune(sparsity)
+            
+        elif method == "Gradient":
+            return self._apply_gradient_pruning(pruned_model, tokeniser, inputs, sparsity, device)
+            
+        elif method == "CausalMaskedSparseGPT":
+            return self._apply_causal_sparsegpt(pruned_model, tokeniser, inputs, sparsity, device)
         
         logger.warning(
-            f"Pruning method '{pruning_config.method_name}' not found. "
-            "Returning original model."
+            f"Pruning method '{method}' not found. Returning original model."
         )
         return model
     
+    def _apply_wanda_from_scores(
+        self, model: nn.Module, sparsity: float, wanda_scores: Dict[str, torch.Tensor]
+    ) -> nn.Module:
+        """Apply Wanda pruning using pre-computed scores."""
+        logger.info("   -> Applying Wanda pruning from cached scores...")
+        for name, module in model.named_modules():
+            if name in wanda_scores and isinstance(module, nn.Linear):
+                scores = wanda_scores[name].to(module.weight.device)
+                threshold = torch.quantile(scores.flatten(), sparsity)
+                mask = (scores > threshold).float()
+                module.weight.data *= mask
+        return model
+
+    def _apply_causal_wanda_from_scores(
+        self, model: nn.Module, sparsity: float, 
+        causal_scores: Dict[str, torch.Tensor], wanda_scores: Dict[str, torch.Tensor]
+    ) -> nn.Module:
+        """Apply Causal Wanda pruning using pre-computed scores."""
+        logger.info("   -> Applying CausalMaskedWanda from cached scores...")
+        for name, module in model.named_modules():
+            if name in wanda_scores and isinstance(module, nn.Linear):
+                scores = wanda_scores[name].to(module.weight.device)
+                
+                # Apply causal masking to boost important weights
+                if name in causal_scores:
+                    causal_importance = causal_scores[name].to(scores.device)
+                    # This logic assumes causal_importance is a scalar per layer; adjust if it's per-weight
+                    if causal_importance.numel() == 1:
+                        protection_threshold = torch.quantile(
+                            torch.tensor(list(causal_scores.values())), 1 - sparsity * 0.5
+                        )
+                        if causal_importance > protection_threshold:
+                            scores *= 1.5 # Boost scores for causally important layers
+                
+                threshold = torch.quantile(scores.flatten(), sparsity)
+                mask = (scores > threshold).float()
+                module.weight.data *= mask
+        return model
+                
     def _get_activations(
         self, model: nn.Module, inputs: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
@@ -1330,46 +1553,6 @@ class ComprehensiveValidationFramework:
         for hook in hooks:
             hook.remove()
         return activations
-    
-    def _apply_wanda_pruning(
-        self, model, tokeniser, inputs, sparsity
-    ) -> nn.Module:
-        """Apply pure Wanda pruning (Weight and Activation)."""
-        logger.info("  -> Applying pure Wanda pruning...")
-        pruned_model = copy.deepcopy(model)
-        activations = self._get_activations(pruned_model, inputs)
-        
-        for name, module in pruned_model.named_modules():
-            if isinstance(module, nn.Linear):
-                if name not in activations:
-                    continue
-                weights = module.weight.data
-                acts = activations[name]
-                scores = torch.abs(weights) * torch.abs(acts).mean(0)
-                
-                threshold = torch.quantile(scores.flatten(), sparsity)
-                mask = (scores > threshold).float()
-                module.weight.data *= mask
-        return pruned_model
-
-    def _apply_sparsegpt_pruning(
-        self, model, inputs, sparsity
-    ) -> nn.Module:
-        """Apply pure SparseGPT-like pruning (simplified)."""
-        logger.info("  -> Applying pure SparseGPT pruning...")
-        pruned_model = copy.deepcopy(model)
-        
-        for name, module in pruned_model.named_modules():
-            if isinstance(module, nn.Linear):
-                weights = module.weight.data
-                # Simplified Hessian approximation
-                hessian_diag = torch.ones_like(weights) * 1e-4 + torch.abs(weights) * 1e-3
-                scores = weights.pow(2) * hessian_diag
-                
-                threshold = torch.quantile(scores.flatten(), sparsity)
-                mask = (scores > threshold).float()
-                module.weight.data *= mask
-        return pruned_model
     
     def _apply_causal_pruning(
         self, model, tokeniser, inputs, sparsity, device
