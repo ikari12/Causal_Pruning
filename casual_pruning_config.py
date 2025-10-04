@@ -1590,6 +1590,77 @@ class ComprehensiveValidationFramework:
             logger.error(f"Failed to load model {model_config.name}: {e}")
             raise
 
+
+    def _apply_hierarchical_pruning(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, torch.Tensor],
+        causal_scores: Dict[str, torch.Tensor],
+        sparsity: float,
+        base_method: str = "Wanda"
+    ) -> nn.Module:
+        """
+        Applies pruning only within causally important modules (Hypothesis 3).
+        """
+        logger.info(f"  -> Applying Hierarchical Causal Pruning with base method: {base_method}...")
+        
+        # 1. Identify causally important modules to serve as the pruning scope.
+        protected_modules = set()
+        if causal_scores:
+            all_causal_scores = torch.tensor(list(causal_scores.values()))
+            # We want to keep (1 - sparsity) modules, so we find the threshold at the sparsity level.
+            # Modules with a score *above* this threshold will be the ones we prune *inside*.
+            protection_threshold = torch.quantile(all_causal_scores, sparsity)
+            
+            for name, score in causal_scores.items():
+                if score > protection_threshold:
+                    protected_modules.add(name)
+        
+        if not protected_modules:
+            logger.warning("No modules identified for hierarchical pruning. Returning original model.")
+            return model
+            
+        logger.info(f"     Pruning will be applied inside these {len(protected_modules)} modules.")
+
+        # 2. Instantiate a pruner for the base method (Wanda or SparseGPT)
+        if base_method == "Wanda":
+            pruner = WandaPruner(model)
+            pruner._capture_activations(inputs)
+        elif base_method == "SparseGPT":
+            pruner = SparseGPTPruner(model)
+            pruner._capture_activations(inputs)
+        else:
+            raise ValueError(f"Unknown base method for hierarchical pruning: {base_method}")
+
+        # 3. Iterate through modules and apply pruning ONLY if they are in the protected set.
+        for name, module in pruner.model.named_modules():
+            if isinstance(module, nn.Linear) and name in pruner.activations and name in protected_modules:
+                weights = module.weight.data
+                act_list = pruner.activations[name]
+                if not act_list: continue
+                
+                concatenated_acts = torch.cat(act_list, dim=0)
+                if concatenated_acts.dim() == 3:
+                    reshaped_acts = concatenated_acts.view(-1, concatenated_acts.shape[-1])
+                else:
+                    reshaped_acts = concatenated_acts
+                
+                # Calculate scores based on the chosen method
+                if base_method == "Wanda":
+                    act_norms = torch.linalg.norm(reshaped_acts.float(), ord=2, dim=0).to(weights.device)
+                    scores = torch.abs(weights) * act_norms.unsqueeze(0)
+                elif base_method == "SparseGPT":
+                    H_diag = 2 * torch.sum(reshaped_acts.float().pow(2), dim=0).to(weights.device)
+                    scores = weights.pow(2) / (H_diag.unsqueeze(0) + 1e-8)
+
+                # Prune weights *within* this important module
+                threshold = torch.quantile(scores.flatten(), sparsity)
+                mask = (scores > threshold).float()
+                module.weight.data *= mask
+
+        return pruner.model
+
+        
     def _apply_pruning(
         self,
         model: nn.Module,
@@ -1606,22 +1677,17 @@ class ComprehensiveValidationFramework:
         pruned_model = copy.deepcopy(model)
         inputs = {k: v.to(device) for k, v in calibration_inputs.items()}
 
-        # --- Methods using PRE-COMPUTED SCORES ---
         if method == "Wanda":
-            # Use the new WandaPruner class
             pruner = WandaPruner(pruned_model)
             return pruner.prune(inputs, sparsity)
         
         elif method == "CausalMaskedWanda":
-            # Create the pruner instance
-            wanda_pruner = WandaWithCausalMasking(pruned_model, None) # Causal calculator not directly needed here
-            # Compute scores with causal scores passed in
+            wanda_pruner = WandaWithCausalMasking(pruned_model, None)
             scores = wanda_pruner.compute_wanda_scores(inputs, causal_scores, sparsity)
-            # Apply pruning using the computed hybrid scores
             return wanda_pruner._apply_structured_pruning(scores, sparsity)
-        
+
         elif method == "Magnitude":
-            logger.info("   -> Applying Magnitude pruning...")
+            logger.info("  -> Applying Magnitude pruning...")
             for _, module in pruned_model.named_modules():
                 if isinstance(module, nn.Linear):
                     scores = torch.abs(module.weight.data)
@@ -1629,42 +1695,61 @@ class ComprehensiveValidationFramework:
                     module.weight.data *= (scores > threshold).float()
             return pruned_model
         
+        elif method == "HierarchicalCausalWanda":
+            return self._apply_hierarchical_pruning(
+                pruned_model, inputs, causal_scores, sparsity, base_method="Wanda"
+            )
+
         elif method == "Causal":
             logger.info("  -> Applying pure Causal pruning...")
-            
             if not causal_scores:
                 logger.warning("Causal scores not found. Returning original model.")
                 return model
             
-            # 1. Gather all scores to determine a global threshold.
             all_scores = torch.tensor(list(causal_scores.values()))
-            
-            # 2. Find the threshold score based on the desired sparsity.
             threshold = torch.quantile(all_scores, sparsity)
 
-            # 3. Iterate through the model and prune layers below the threshold.
             for name, module in pruned_model.named_modules():
                 if name in causal_scores:
                     if causal_scores[name] < threshold:
-                        # Prune this module by zeroing out its weights.
                         if hasattr(module, 'weight') and module.weight is not None:
                             module.weight.data.zero_()
                         if hasattr(module, 'bias') and module.bias is not None:
                             module.bias.data.zero_()
-            
             return pruned_model
-                
-        # --- Methods requiring ON-THE-FLY COMPUTATION ---
+            
         elif method == "SparseGPT":
             pruner = SparseGPTPruner(pruned_model)
-            # Pass the calibration inputs to the prune method
             return pruner.prune(inputs, sparsity)
 
-        elif method == "Gradient":
-            return self._apply_gradient_pruning(pruned_model, tokeniser, inputs, sparsity, device)
-            
+        # --- ▼▼▼ THIS IS THE CORRECTED BLOCK ▼▼▼ ---
         elif method == "CausalMaskedSparseGPT":
-            return self._apply_causal_sparsegpt(pruned_model, tokeniser, inputs, sparsity, device)
+            # The causal_calculator is not directly needed if we pass scores, so pass None.
+            sparse_pruner = SparseGPTWithCausalMasking(pruned_model, None)
+            
+            # The prune_with_causal_masking method now correctly receives all its arguments.
+            return sparse_pruner.prune_with_causal_masking(inputs, causal_scores, sparsity)
+        # --- ▲▲▲ END OF CORRECTION ▲▲▲ ---
+
+        elif method == "Gradient":
+            # NOTE: This is a simple implementation. A more rigorous one would handle labels.
+            logger.info("  -> Applying Gradient pruning...")
+            pruned_model.train()
+            outputs = pruned_model(**inputs)
+            
+            # Use the sum of logits as a proxy for loss if no labels are available
+            loss = outputs.logits.sum()
+            loss.backward()
+
+            for _, module in pruned_model.named_modules():
+                if isinstance(module, nn.Linear) and hasattr(module.weight, 'grad') and module.weight.grad is not None:
+                    scores = torch.abs(module.weight.grad * module.weight.data) # SNIP-like score
+                    threshold = torch.quantile(scores.flatten(), sparsity)
+                    module.weight.data *= (scores > threshold).float()
+
+            pruned_model.zero_grad(set_to_none=True)
+            pruned_model.eval()
+            return pruned_model
         
         logger.warning(
             f"Pruning method '{method}' not found. Returning original model."
@@ -1810,6 +1895,7 @@ class ComprehensiveValidationFramework:
             "total_experiments": len(results_df),
             "completion_time": pd.Timestamp.now()
         }
+    
 
     def _generate_performance_summary(
         self, results_df: pd.DataFrame
@@ -1838,70 +1924,225 @@ class ComprehensiveValidationFramework:
             
         return summary
 
+    def _setup_academic_style(self, results_df: pd.DataFrame):
+        """Sets up matplotlib and seaborn styles for academic publication."""
+        sns.set_style("ticks")
+        # Use a colorblind-friendly palette for accessibility and better printing
+        try:
+            # Determine the number of unique methods to set the palette size
+            n_methods = results_df["pruning_method"].nunique()
+            palette = sns.color_palette("colorblind", n_methods)
+        except:
+            palette = sns.color_palette("colorblind")
+        
+        # Font settings (customize as needed)
+        plt.rcParams['font.size'] = 10
+        plt.rcParams['axes.labelsize'] = 12
+        plt.rcParams['axes.titlesize'] = 14
+        return palette
+
+    def _plot_performance_vs_sparsity(self, results_df: pd.DataFrame, palette) -> str:
+        """Figure A: Performance vs Sparsity with 95% CI."""
+        plt.figure(figsize=(10, 6))
+
+        # Define markers for better differentiation (e.g., in black/white printing)
+        methods = results_df["pruning_method"].unique()
+        markers = ["o", "s", "D", "^", "v", "<", ">", "p", "*", "h"]
+        # Ensure enough markers for all methods
+        if len(methods) > len(markers):
+            markers = markers * (len(methods) // len(markers) + 1)
+        marker_map = {method: markers[i] for i, method in enumerate(methods)}
+
+        # Use lineplot with error bands (95% CI)
+        sns.lineplot(
+            data=results_df, x="sparsity", y="performance", hue="pruning_method",
+            style="pruning_method", markers=marker_map, dashes=False, palette=palette,
+            errorbar=('ci', 95), linewidth=2, markersize=8
+        )
+
+        # Add baseline reference line (Sparsity=0.0)
+        if 0.0 in results_df["sparsity"].values:
+            baseline_perf = results_df[results_df["sparsity"] == 0.0]["performance"].mean()
+            plt.axhline(baseline_perf, color='gray', linestyle='--', alpha=0.7, label=f'Baseline Avg: {baseline_perf:.3f}')
+
+        plt.title("Performance vs. Sparsity Level (95% CI)")
+        plt.xlabel("Sparsity")
+        # Format x-axis as percentage
+        plt.gca().xaxis.set_major_formatter(mtick.PercentFormatter(xmax=1.0))
+        plt.ylabel("Average Performance")
+        plt.legend(title="Method", bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+        sns.despine() # Remove the top and right spines
+
+        path = f"{self.config.results_dir}/FigA_performance_vs_sparsity.png"
+        plt.tight_layout()
+        plt.savefig(path, dpi=300, bbox_inches='tight')
+        plt.close()
+        return path
+
+    def _plot_task_robustness(self, results_df: pd.DataFrame, palette) -> str:
+        """Figure B: Performance drop at high sparsity across task types."""
+        
+        # Determine the highest sparsity level tested
+        max_sparsity = results_df["sparsity"].max()
+        if max_sparsity == 0.0:
+            return ""
+
+        # 1. Calculate baseline performance (sparsity=0.0)
+        baseline_df = results_df[results_df["sparsity"] == 0.0]
+        # Calculate average baseline performance per model/dataset/task across runs
+        baseline_perf = baseline_df.groupby(["model", "dataset", "task_type"])["performance"].mean().reset_index()
+        baseline_perf.rename(columns={"performance": "baseline_performance"}, inplace=True)
+
+        # 2. Filter data for the high sparsity level
+        # Use near equality for floating point comparison
+        high_sparsity_df = results_df[abs(results_df["sparsity"] - max_sparsity) < 1e-5]
+
+        # 3. Merge and calculate performance drop
+        merged_df = pd.merge(high_sparsity_df, baseline_perf, on=["model", "dataset", "task_type"], how='left')
+        merged_df = merged_df.dropna(subset=["baseline_performance"])
+        # Avoid division by zero if baseline performance is 0
+        merged_df["baseline_performance_safe"] = merged_df["baseline_performance"].replace(0, 1e-8)
+
+        # Calculate drop percentage relative to baseline
+        merged_df["performance_drop_pct"] = (
+            (merged_df["baseline_performance"] - merged_df["performance"]) /
+            merged_df["baseline_performance_safe"]
+        ) * 100
+
+        # 4. Plotting (Using barplot to compare means with CI)
+        plt.figure(figsize=(12, 7))
+        sns.barplot(
+            data=merged_df,
+            x="task_type",
+            y="performance_drop_pct",
+            hue="pruning_method",
+            palette=palette,
+            errorbar=('ci', 95),
+            capsize=.1
+        )
+
+        plt.title(f"Performance Drop Rate at {max_sparsity*100:.0f}% Sparsity by Task Type")
+        plt.xlabel("Task Type")
+        plt.ylabel("Performance Drop (%)")
+        plt.xticks(rotation=45, ha='right')
+        plt.legend(title="Method", bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(axis='y', alpha=0.3)
+        plt.axhline(0, color='grey', linestyle='--', alpha=0.7) # Line at 0% drop
+        sns.despine()
+
+        path = f"{self.config.results_dir}/FigB_task_robustness_analysis.png"
+        plt.tight_layout()
+        plt.savefig(path, dpi=300, bbox_inches='tight')
+        plt.close()
+        return path
+
+    def _plot_causal_importance_distribution(self) -> str:
+        """Figure C: Visualise the distribution of causal importance across layers."""
+        if not self.importance_cache:
+            return ""
+
+        # 1. Aggregate scores from the cache
+        score_data = []
+        for (model_name, dataset_name), scores in self.importance_cache.items():
+            if "causal" in scores:
+                # Find task type associated with the dataset from configuration
+                task_type = "Unknown"
+                for cfg in self.config.datasets:
+                    if cfg.name == dataset_name:
+                        task_type = cfg.task_type
+                        break
+                
+                for layer_name, importance in scores["causal"].items():
+                    # Attempt to extract layer index (Heuristic for BERT-like architectures)
+                    try:
+                        # e.g., "encoder.layer.5.attention..."
+                        parts = layer_name.split('.')
+                        if 'layer' in parts:
+                            layer_index = int(parts[parts.index('layer') + 1])
+                        else:
+                            continue # Skip non-layer specific modules (e.g., pooler)
+                    except (ValueError, IndexError):
+                        continue
+
+                    score_data.append({
+                        "model": model_name,
+                        "task_type": task_type,
+                        "layer_index": layer_index,
+                        "importance": importance.item() if torch.is_tensor(importance) else importance
+                    })
+
+        if not score_data:
+            return ""
+
+        plot_df = pd.DataFrame(score_data)
+
+        # 2. Plotting (Averaged by Task Type)
+        plt.figure(figsize=(10, 6))
+
+        # Show how importance distribution varies by the type of task across all models
+        sns.lineplot(
+            data=plot_df,
+            x="layer_index",
+            y="importance",
+            hue="task_type",
+            style="task_type",
+            marker='o',
+            errorbar=('ci', 95),
+            linewidth=2
+        )
+
+        plt.title("Average Causal Importance Distribution Across Layers")
+        plt.xlabel("Layer Index")
+        plt.ylabel("Causal Importance (KL Divergence)")
+        plt.legend(title="Task Type", bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+        sns.despine()
+
+        path = f"{self.config.results_dir}/FigC_causal_importance_distribution.png"
+        plt.tight_layout()
+        plt.savefig(path, dpi=300, bbox_inches='tight')
+        plt.close()
+        return path
+    
+
     def _generate_visualisations(
         self, results_df: pd.DataFrame
     ) -> Dict[str, str]:
         """Generate and save comprehensive visualisations."""
         if results_df.empty:
             return {}
-        
+
         viz_paths = {}
+        # Apply academic style settings and get the color palette
+        palette = self._setup_academic_style(results_df)
+
+        logger.info("Generating academic visualisations...")
+
+        # --- Figure A: Performance vs Sparsity ---
+        try:
+            path = self._plot_performance_vs_sparsity(results_df, palette)
+            if path: viz_paths["FigA_sparsity_analysis"] = path
+        except Exception as e:
+            logger.warning(f"Failed to generate Figure A (Sparsity Analysis): {e}")
+
+        # --- Figure B: Task Robustness Analysis ---
+        try:
+            path = self._plot_task_robustness(results_df, palette)
+            if path: viz_paths["FigB_task_robustness"] = path
+        except Exception as e:
+            logger.warning(f"Failed to generate Figure B (Task Robustness): {e}")
+
+        # --- Figure C: Causal Importance Distribution ---
+        try:
+            # Figure C uses its own palette logic based on task types, not methods
+            path = self._plot_causal_importance_distribution()
+            if path: viz_paths["FigC_causal_distribution"] = path
+        except Exception as e:
+            logger.warning(f"Failed to generate Figure C (Causal Distribution): {e}")
+
+        # Reset style to default after generation
         plt.style.use('default')
-        sns.set_palette("husl")
-
-        # Visualisation 1: Method performance bar chart
-        plt.figure(figsize=(12, 8))
-        method_data = results_df.groupby("pruning_method")["performance"].agg(
-            ["mean", "std"]
-        )
-        bars = plt.bar(
-            method_data.index, method_data["mean"],
-            yerr=method_data["std"], capsize=5, alpha=0.7
-        )
-        plt.title(
-            "Performance Comparison Across Pruning Methods",
-            fontsize=16, fontweight='bold'
-        )
-        plt.xlabel("Pruning Method", fontsize=12)
-        plt.ylabel("Average Performance", fontsize=12)
-        plt.xticks(rotation=45, ha='right')
-        plt.grid(axis='y', alpha=0.3)
-        for bar, mean in zip(bars, method_data["mean"]):
-            plt.text(
-                bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                f'{mean:.3f}', ha='center', va='bottom', fontweight='bold'
-            )
-        path = f"{self.config.results_dir}/method_performance_comparison.png"
-        plt.tight_layout()
-        plt.savefig(path, dpi=300, bbox_inches='tight')
-        plt.close()
-        viz_paths["method_comparison"] = path
-        
-        # Visualisation 2: Performance vs Sparsity line plot
-        plt.figure(figsize=(14, 8))
-        for method in results_df["pruning_method"].unique():
-            method_df = results_df[results_df["pruning_method"] == method]
-            sparsity_perf = method_df.groupby("sparsity")["performance"].agg(
-                ["mean", "std"]
-            )
-            plt.errorbar(
-                sparsity_perf.index * 100, sparsity_perf["mean"],
-                yerr=sparsity_perf["std"], marker='o', linewidth=2,
-                markersize=8, label=method, capsize=5
-            )
-        plt.title(
-            "Performance vs Sparsity Level", fontsize=16, fontweight='bold'
-        )
-        plt.xlabel("Sparsity (%)", fontsize=12)
-        plt.ylabel("Performance", fontsize=12)
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        plt.grid(alpha=0.3)
-        path = f"{self.config.results_dir}/performance_vs_sparsity.png"
-        plt.tight_layout()
-        plt.savefig(path, dpi=300, bbox_inches='tight')
-        plt.close()
-        viz_paths["sparsity_analysis"] = path
-
         return viz_paths
 
     def _save_intermediate_results(self):

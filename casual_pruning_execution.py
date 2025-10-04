@@ -17,6 +17,8 @@ import shutil
 
 # Third-party imports
 import pandas as pd
+from tabulate import tabulate
+import matplotlib.ticker as mtick
 
 # Local application imports
 from casual_pruning_config import (
@@ -64,15 +66,6 @@ def create_demo_config() -> ExperimentConfig:
             text_columns=["sentence1", "sentence2"],
             label_column="label",
         ),
-        DatasetConfig(
-            name="JMTEB-JQaRA-Retrieval",
-            dataset_path="sbintuitions/JMTEB",
-            subset="jqara-query",
-            task_type="retrieval",
-            metric="ndcg_at_10",
-            text_columns=["query", "positive", "negative"],
-            label_column="label",
-        ),
     ]
     # Correction: Add pure 'Wanda' and 'SparseGPT' to the list.
     pruning_configs = [
@@ -85,18 +78,16 @@ def create_demo_config() -> ExperimentConfig:
             sparsity_levels=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         ),
         PruningConfig(
-            method_name="CausalMaskedWanda",
-            sparsity_levels=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-            causal_masking=True
-        ),
-        PruningConfig(
             method_name="SparseGPT",
             sparsity_levels=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         ),
         PruningConfig(
-            method_name="CausalMaskedSparseGPT",
-            sparsity_levels=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-            causal_masking=True
+            method_name="HierarchicalCausalWanda",
+            sparsity_levels=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        ),
+        PruningConfig(
+            method_name="HierarchicalCausalSparseGPT",
+            sparsity_levels=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         ),
         PruningConfig(
             method_name="Gradient",
@@ -112,7 +103,7 @@ def create_demo_config() -> ExperimentConfig:
         datasets=datasets,
         pruning_configs=pruning_configs,
         random_seed=42,
-        num_runs=2,
+        num_runs=1,
         statistical_test="wilcoxon",
         significance_level=0.05,
         results_dir="/app/results",
@@ -308,7 +299,7 @@ def print_configuration_summary(config: ExperimentConfig):
 
     logger.info(f"\nDatasets ({len(config.datasets)}):")
     task_counts = {}
-    for dataset in config.datasets:
+    for dataset in config.datasets: # This line is now correct
         task_counts[dataset.task_type] = (
             task_counts.get(dataset.task_type, 0) + 1
         )
