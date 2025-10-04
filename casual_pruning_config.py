@@ -20,6 +20,7 @@ import warnings
 
 # Third-party imports
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick 
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -966,7 +967,7 @@ class SparseGPTPruner:
                 H_diag = 2 * torch.sum(reshaped_acts.float().pow(2), dim=0)
                 
                 # The importance score is W^2 / diag(H_inv), which is approx. W^2 * diag(H).
-                scores = weights.pow(2) * H_diag.unsqueeze(0)
+                scores = weights.pow(2) / (H_diag.unsqueeze(0) + 1e-8) # Add epsilon for numerical stability    
                 
                 # Mask and prune
                 threshold = torch.quantile(scores.flatten(), sparsity)
@@ -1677,30 +1678,7 @@ class ComprehensiveValidationFramework:
         pruned_model = copy.deepcopy(model)
         inputs = {k: v.to(device) for k, v in calibration_inputs.items()}
 
-        if method == "Wanda":
-            pruner = WandaPruner(pruned_model)
-            return pruner.prune(inputs, sparsity)
-        
-        elif method == "CausalMaskedWanda":
-            wanda_pruner = WandaWithCausalMasking(pruned_model, None)
-            scores = wanda_pruner.compute_wanda_scores(inputs, causal_scores, sparsity)
-            return wanda_pruner._apply_structured_pruning(scores, sparsity)
-
-        elif method == "Magnitude":
-            logger.info("  -> Applying Magnitude pruning...")
-            for _, module in pruned_model.named_modules():
-                if isinstance(module, nn.Linear):
-                    scores = torch.abs(module.weight.data)
-                    threshold = torch.quantile(scores.flatten(), sparsity)
-                    module.weight.data *= (scores > threshold).float()
-            return pruned_model
-        
-        elif method == "HierarchicalCausalWanda":
-            return self._apply_hierarchical_pruning(
-                pruned_model, inputs, causal_scores, sparsity, base_method="Wanda"
-            )
-
-        elif method == "Causal":
+        if method == "Causal":
             logger.info("  -> Applying pure Causal pruning...")
             if not causal_scores:
                 logger.warning("Causal scores not found. Returning original model.")
@@ -1718,9 +1696,56 @@ class ComprehensiveValidationFramework:
                             module.bias.data.zero_()
             return pruned_model
             
+        elif method == "Magnitude":
+            logger.info("  -> Applying Magnitude pruning...")
+            for _, module in pruned_model.named_modules():
+                if isinstance(module, nn.Linear):
+                    scores = torch.abs(module.weight.data)
+                    threshold = torch.quantile(scores.flatten(), sparsity)
+                    module.weight.data *= (scores > threshold).float()
+            return pruned_model
+
+        elif method == "Gradient":
+            logger.info("  -> Applying Gradient pruning...")
+            pruned_model.train()
+
+            batch_size = 16
+            total_samples = inputs['input_ids'].shape[0]
+            pruned_model.zero_grad()
+
+            for i in tqdm(range(0, total_samples, batch_size), desc="  -> Calculating Gradients", leave=False, ncols=100):
+                batch_inputs = {k: v[i:i + batch_size] for k, v in inputs.items()}
+                outputs = pruned_model(**batch_inputs)
+                
+                if hasattr(outputs, 'logits'):
+                    loss = outputs.logits.sum()
+                else:
+                    loss = outputs.last_hidden_state.sum()
+                
+                loss.backward()
+            
+            for _, module in pruned_model.named_modules():
+                if isinstance(module, nn.Linear) and hasattr(module.weight, 'grad') and module.weight.grad is not None:
+                    scores = torch.abs(module.weight.grad * module.weight.data) # SNIP-like score
+                    threshold = torch.quantile(scores.flatten(), sparsity)
+                    module.weight.data *= (scores > threshold).float()
+
+            pruned_model.zero_grad(set_to_none=True)
+            pruned_model.eval()
+            return pruned_model
+        
+        elif method == "Wanda":
+            pruner = WandaPruner(pruned_model)
+            return pruner.prune(inputs, sparsity)
+        
         elif method == "SparseGPT":
             pruner = SparseGPTPruner(pruned_model)
             return pruner.prune(inputs, sparsity)
+
+        elif method == "CausalMaskedWanda":
+            wanda_pruner = WandaWithCausalMasking(pruned_model, None)
+            scores = wanda_pruner.compute_wanda_scores(inputs, causal_scores, sparsity)
+            return wanda_pruner._apply_structured_pruning(scores, sparsity)
 
         # --- ▼▼▼ THIS IS THE CORRECTED BLOCK ▼▼▼ ---
         elif method == "CausalMaskedSparseGPT":
@@ -1731,25 +1756,15 @@ class ComprehensiveValidationFramework:
             return sparse_pruner.prune_with_causal_masking(inputs, causal_scores, sparsity)
         # --- ▲▲▲ END OF CORRECTION ▲▲▲ ---
 
-        elif method == "Gradient":
-            # NOTE: This is a simple implementation. A more rigorous one would handle labels.
-            logger.info("  -> Applying Gradient pruning...")
-            pruned_model.train()
-            outputs = pruned_model(**inputs)
-            
-            # Use the sum of logits as a proxy for loss if no labels are available
-            loss = outputs.logits.sum()
-            loss.backward()
+        elif method == "HierarchicalCausalWanda":
+            return self._apply_hierarchical_pruning(
+                pruned_model, inputs, causal_scores, sparsity, base_method="Wanda"
+            )
 
-            for _, module in pruned_model.named_modules():
-                if isinstance(module, nn.Linear) and hasattr(module.weight, 'grad') and module.weight.grad is not None:
-                    scores = torch.abs(module.weight.grad * module.weight.data) # SNIP-like score
-                    threshold = torch.quantile(scores.flatten(), sparsity)
-                    module.weight.data *= (scores > threshold).float()
-
-            pruned_model.zero_grad(set_to_none=True)
-            pruned_model.eval()
-            return pruned_model
+        elif method == "HierarchicalCausalSparseGPT":
+            return self._apply_hierarchical_pruning(
+                pruned_model, inputs, causal_scores, sparsity, base_method="SparseGPT"
+            )
         
         logger.warning(
             f"Pruning method '{method}' not found. Returning original model."
@@ -1965,6 +1980,7 @@ class ComprehensiveValidationFramework:
             baseline_perf = results_df[results_df["sparsity"] == 0.0]["performance"].mean()
             plt.axhline(baseline_perf, color='gray', linestyle='--', alpha=0.7, label=f'Baseline Avg: {baseline_perf:.3f}')
 
+        plt.yscale('log') 
         plt.title("Performance vs. Sparsity Level (95% CI)")
         plt.xlabel("Sparsity")
         # Format x-axis as percentage
@@ -2172,14 +2188,96 @@ class ComprehensiveValidationFramework:
         self._generate_markdown_report(results)
         logger.info(f"Results saved to {self.config.results_dir}")
     
-    def _generate_markdown_report(self, results: Dict[str, Any]):
-        """Generate a brief markdown report of the results."""
-        report_path = f"{self.config.results_dir}/summary_report.md"
-        with open(report_path, 'w', encoding='utf-8') as f:
-            f.write("# Causal Pruning Validation Report\n\n")
-            f.write("Report generation is a placeholder in this version.\n")
-        logger.info(f"Summary report saved to {report_path}")
 
+    def _generate_markdown_report(self, results: Dict[str, Any]):
+        """Generate a comprehensive markdown report of the results."""
+        report_path = f"{self.config.results_dir}/summary_report.md"
+        try:
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write("# Causal Pruning Validation Report\n\n")
+                f.write(f"**Date:** {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"**Total Experiments:** {results.get('total_experiments', 0)}\n\n")
+
+                # --- Figure D: Conceptual Framework (Mermaid Diagram) ---
+                f.write("## Conceptual Framework (Figure D)\n\n")
+                f.write("```mermaid\n")
+                f.write("graph TD\n")
+                f.write("    subgraph A[A: Causal Importance Estimation]\n")
+                f.write("        direction LR\n")
+                f.write("        Input[Calibration Data] --> Model\n")
+                f.write("        Intervention[Intervention: Noise Injection at Layer L] --> Model\n")
+                f.write("        Model -- Original Output --> O1[P(Y|X)]\n")
+                f.write("        Model -- Intervened Output --> O2[P(Y|X, do(L=noise))]\n")
+                f.write("        O1 & O2 --> KLD[KL Divergence]\n")
+                f.write("        KLD --> Map[Causal Importance Map]\n")
+                f.write("    end\n\n")
+                f.write("    subgraph B[B: Causal Adaptive Pruning]\n")
+                f.write("        direction LR\n")
+                f.write("        A2[Input Data] --> B2(Calculate Scores - Wanda/SparseGPT);\n")
+                f.write("        Map2[Causal Importance Map] --> C2(Adaptive Masking/Hierarchical Selection);\n")
+                f.write("        B2 --> C2\n")
+                f.write("        C2 --> D2{Apply Threshold};\n")
+                f.write("        D2 --> E2[Pruned Model];\n")
+                f.write("    end\n")
+                f.write("```\n\n")
+
+                # --- Table E: Statistical Significance Analysis ---
+                f.write("## Statistical Significance Analysis (Table E)\n\n")
+                f.write("Wilcoxon signed-rank test results compared against the baseline (default: Magnitude):\n\n")
+
+                stats_summary = results.get("statistical_summary", {}).get("significance_tests", {})
+                if stats_summary:
+                    headers = ["Method (A)", "Baseline (B)", "Mean Diff (A-B)", "p-value", "Effect Size (Cohen's d)", "Significant?"]
+                    table_data = []
+                    
+                    # Assuming baseline is 'Magnitude' based on StatisticalAnalyser implementation
+                    baseline_name = "Magnitude" 
+
+                    for method, data in stats_summary.items():
+                        p_val = data.get("p_value", 1.0)
+                        effect_size = data.get("effect_size", 0.0)
+                        mean_diff = data.get("mean_difference", 0.0)
+                        significant = data.get("significant", False)
+
+                        # Formatting p-value with significance markers
+                        if p_val < 0.001: p_str = "**<0.001***"
+                        elif p_val < 0.01: p_str = f"**{p_val:.3f}**"
+                        elif p_val < 0.05: p_str = f"**{p_val:.3f}*"
+                        else: p_str = f"{p_val:.3f}"
+
+                        table_data.append([
+                            method,
+                            baseline_name,
+                            f"{mean_diff:+.4f}",
+                            p_str,
+                            f"{effect_size:.3f}",
+                            'Yes' if significant else 'No'
+                        ])
+                    
+                    # Use tabulate for clean Markdown table generation
+                    f.write(tabulate(table_data, headers=headers, tablefmt="pipe"))
+                    f.write("\n\n(* p<0.05, ** p<0.01, *** p<0.001)\n\n")
+                else:
+                    f.write("Statistical summary not available.\n\n")
+
+                # --- Visualisations Links/Embedding ---
+                f.write("## Visualisations\n\n")
+                viz_paths = results.get("visualisation_paths", {})
+                if viz_paths:
+                    # Use Path().name to get relative paths for embedding images in Markdown
+                    if 'FigA_sparsity_analysis' in viz_paths and viz_paths['FigA_sparsity_analysis']:
+                        f.write(f"### Figure A: Performance vs. Sparsity\n")
+                        f.write(f"![Figure A]({Path(viz_paths['FigA_sparsity_analysis']).name})\n\n")
+                    if 'FigB_task_robustness' in viz_paths and viz_paths['FigB_task_robustness']:
+                        f.write(f"### Figure B: Task Robustness Analysis\n")
+                        f.write(f"![Figure B]({Path(viz_paths['FigB_task_robustness']).name})\n\n")
+                    if 'FigC_causal_distribution' in viz_paths and viz_paths['FigC_causal_distribution']:
+                        f.write(f"### Figure C: Causal Importance Distribution\n")
+                        f.write(f"![Figure C]({Path(viz_paths['FigC_causal_distribution']).name})\n\n")
+
+            logger.info(f"Summary report saved to {report_path}")
+        except Exception as e:
+            logger.error(f"Error generating Markdown report: {e}", exc_info=True)
 
 if __name__ == "__main__":
     logger.info("This script defines the configuration and framework.")
