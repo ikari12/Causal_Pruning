@@ -43,7 +43,7 @@ from transformers import (
     RobertaForSequenceClassification,
     RobertaModel,
 )
-BATCH_SIZE = 64
+BATCH_SIZE = 256
 
 warnings.filterwarnings('ignore')
 
@@ -1357,6 +1357,32 @@ class ComprehensiveEvaluator:
     def _evaluate_similarity(
         self, model: nn.Module, tokeniser, dataset, config: DatasetConfig
     ) -> Dict[str, float]:
+        """Evaluate similarity task using batched inference."""
+        if dataset is None:
+            return {"pearson": 0.0, "samples": 0}
+
+        sents1 = [ex[config.text_columns[0]] for ex in dataset]
+        sents2 = [ex[config.text_columns[1]] for ex in dataset]
+        true_scores = [float(ex[config.label_column]) for ex in dataset]
+        
+        embeddings1 = self._get_embeddings_batched(model, tokeniser, sents1)
+        embeddings2 = self._get_embeddings_batched(model, tokeniser, sents2)
+        
+        embeddings1 = torch.from_numpy(embeddings1)
+        embeddings2 = torch.from_numpy(embeddings2)
+
+        predictions = torch.nn.functional.cosine_similarity(embeddings1, embeddings2, dim=1).numpy()
+        
+        if len(predictions) > 1:
+            pearson_corr, _ = stats.pearsonr(true_scores, predictions)
+            return {"pearson": pearson_corr, "samples": len(predictions)}
+        
+        return {"pearson": 0.0, "samples": len(predictions)}
+    
+    '''
+    def _evaluate_similarity(
+        self, model: nn.Module, tokeniser, dataset, config: DatasetConfig
+    ) -> Dict[str, float]:
         """Evaluate similarity task."""
         if dataset is None:
             return {"pearson": 0.0, "samples": 0}
@@ -1377,7 +1403,37 @@ class ComprehensiveEvaluator:
             pearson_corr, _ = stats.pearsonr(true_scores, predictions)
             return {"pearson": pearson_corr, "samples": len(predictions)}
         return {"pearson": 0.0, "samples": len(predictions)}
+    '''
+        
+    def _get_embeddings_batched(
+        self, model: nn.Module, tokeniser, texts: List[str], batch_size: int = BATCH_SIZE
+    ) -> np.ndarray:
+        """Get embeddings for a list of texts in batches."""
+        all_embeddings = []
+        model.eval()
+        device = next(model.parameters()).device
 
+        for i in tqdm(range(0, len(texts), batch_size), desc=" -> Generating embeddings", leave=False, ncols=100):
+            batch_texts = texts[i:i + batch_size]
+            inputs = tokeniser(
+                batch_texts, max_length=512, truncation=True, padding=True, return_tensors="pt"
+            )
+            
+            with torch.no_grad():
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                outputs = model(**inputs)
+                
+                if hasattr(outputs, 'last_hidden_state'):
+                    # CLSプーリングやmeanプーリングなど、モデルに合わせた処理
+                    # ここでは mean pooling を使用
+                    embeddings = outputs.last_hidden_state.mean(dim=1)
+                else:
+                    embeddings = outputs.pooler_output
+                
+                all_embeddings.append(embeddings.cpu().numpy())
+        
+        return np.vstack(all_embeddings)
+    
     def _get_embedding(
         self, model: nn.Module, tokeniser, text: str
     ) -> torch.Tensor:
@@ -1687,15 +1743,24 @@ class ComprehensiveValidationFramework:
                     pruned_model, tokeniser, data_cfg, prune_cfg
                 )
                 
+                if sparsity > 0:
+                    total_params = sum(p.numel() for p in pruned_model.parameters() if p.requires_grad)
+                    nonzero_params = sum(torch.count_nonzero(p).item() for p in pruned_model.parameters() if p.requires_grad)
+                    actual_sparsity = 1.0 - (nonzero_params / total_params)
+                else:
+                    actual_sparsity = 0.0
+                
                 result = {
                     "model": model_cfg.name, "dataset": data_cfg.name,
                     "task_type": data_cfg.task_type,
                     "pruning_method": prune_cfg.method_name,
-                    "sparsity": sparsity, "run": run,
+                    "sparsity": sparsity, "run": run, # 'sparsity' は 'target_sparsity' として扱う
+                    "target_sparsity": sparsity,
+                    "actual_sparsity": actual_sparsity,
                     "performance": eval_results.get(data_cfg.metric, 0.0),
                     "additional_metrics": eval_results,
                     "timestamp": pd.Timestamp.now(),
-                }
+                }                
                 self.results.append(result)
 
                 if (self.config.save_intermediate and 
@@ -1733,73 +1798,6 @@ class ComprehensiveValidationFramework:
         logger.info(f"       Non-Zero Params: {nonzero_params:,} ({100-sparsity:.1f}%)")
         logger.info(f"       Sparsity: {sparsity:.2f}%")
 
-
-    def _run_single_experiment(
-        self,
-        model_config: ModelConfig,
-        dataset_config: DatasetConfig,
-        pruning_config: PruningConfig,
-        sparsity: float,
-        run: int,
-    ) -> Dict[str, Any]:
-        """Run a single experiment."""
-        run_desc = (
-            f"{model_config.name} | {dataset_config.name} | "
-            f"{pruning_config.method_name} | {sparsity} | Run {run}"
-        )
-        logger.info(f"Running: {run_desc}")
-        try:
-            model, tokeniser = self._load_model_and_tokeniser(
-                model_config, dataset_config.task_type
-            )
-            if sparsity > 0:
-                self._report_model_size(model, "Original Model")
-
-            if sparsity > 0:
-                calib_dataset = self.evaluator._load_dataset(dataset_config)
-                calib_inputs = self._prepare_calibration_data(
-                    calib_dataset, tokeniser, dataset_config.text_columns
-                )
-                model = self._apply_pruning(
-                    model, tokeniser, pruning_config, sparsity, calib_inputs
-                )
-                self._report_model_size(model, f"Pruned Model ({pruning_config.method_name} @ {sparsity*100:.0f}%)")
-            
-            eval_results = self.evaluator.evaluate_model_on_dataset(
-                model, tokeniser, dataset_config, pruning_config
-            )
-            
-            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            nonzero_params = sum(torch.count_nonzero(p).item() for p in model.parameters() if p.requires_grad)
-            actual_sparsity = 1.0 - (nonzero_params / total_params)
-
-            result = {
-                "model": model_config.name,
-                "dataset": dataset_config.name,
-                "task_type": dataset_config.task_type,
-                "pruning_method": pruning_config.method_name,
-                "sparsity": sparsity,
-                "run": run,
-                "target_sparsity": sparsity, 
-                "actual_sparsity": actual_sparsity, 
-                "performance": eval_results.get(dataset_config.metric, 0.0),
-                "additional_metrics": eval_results,
-                "timestamp": pd.Timestamp.now(),
-            }
-            logger.info(
-                f"  -> Completed. Score ({dataset_config.metric}): "
-                f"{result['performance']:.4f}"
-            )
-            return result
-        except Exception as e:
-            logger.error(f"Single experiment failed: {e}", exc_info=True)
-            return {
-                "model": model_config.name, "dataset": dataset_config.name,
-                "task_type": dataset_config.task_type,
-                "pruning_method": pruning_config.method_name,
-                "sparsity": sparsity, "run": run, "performance": 0.0,
-                "error": str(e), "timestamp": pd.Timestamp.now()
-            }
 
     def _prepare_calibration_data(
         self, dataset, tokeniser, text_columns: List[str], num_samples: int = None
@@ -1999,7 +1997,7 @@ class ComprehensiveValidationFramework:
             hook.remove()
 
         for name, module in model.named_modules():
-            if name in protected_modules:
+            if isinstance(module, nn.Linear) and any(name.startswith(p) for p in protected_modules):
                 weights = module.weight.data
                 
                 if base_method == "Wanda":
@@ -2407,6 +2405,72 @@ class ComprehensiveValidationFramework:
         plt.close()
         return path
 
+    def _plot_performance_heatmap(self, results_df: pd.DataFrame, palette) -> str:
+        """Figure E: Heatmap of Performance vs. Target Sparsity, annotated with Actual Sparsity."""
+        if "target_sparsity" not in results_df.columns or "actual_sparsity" not in results_df.columns:
+            return ""
+
+        summary_df = results_df.groupby(["pruning_method", "target_sparsity"]).agg(
+            performance=('performance', 'mean'),
+            actual_sparsity=('actual_sparsity', 'mean')
+        ).reset_index()
+
+        performance_pivot = summary_df.pivot(index="pruning_method", columns="target_sparsity", values="performance")
+        actual_sparsity_pivot = summary_df.pivot(index="pruning_method", columns="target_sparsity", values="actual_sparsity")
+
+        plt.figure(figsize=(12, 8))
+        
+        ax = sns.heatmap(
+            performance_pivot,
+            annot=actual_sparsity_pivot, 
+            fmt=".1%",                   
+            cmap="viridis",              
+            linewidths=.5,
+            annot_kws={"size": 10}       
+        )
+
+        ax.set_title("Performance Heatmap (Color) vs. Target Sparsity\nAnnotated with Actual Sparsity (%)")
+        ax.set_xlabel("Target Sparsity")
+        ax.set_ylabel("Pruning Method")
+        plt.xticks(rotation=45)
+        plt.yticks(rotation=0)
+
+        path = f"{self.config.results_dir}/FigE_performance_heatmap.png"
+        plt.tight_layout()
+        plt.savefig(path, dpi=300, bbox_inches='tight')
+        plt.close()
+        return path
+    
+    def _plot_actual_sparsity_vs_performance(self, results_df: pd.DataFrame, palette) -> str:
+            """Figure F: Scatter plot of Actual Sparsity vs. Performance."""
+            if "actual_sparsity" not in results_df.columns:
+                return ""
+
+            plt.figure(figsize=(10, 6))
+            
+            sns.scatterplot(
+                data=results_df,
+                x="actual_sparsity",
+                y="performance",
+                hue="pruning_method",
+                style="pruning_method",
+                palette=palette,
+                s=100  
+            )
+            
+            plt.title("Performance vs. Actual Sparsity")
+            plt.xlabel("Actual Measured Sparsity")
+            plt.ylabel("Performance")
+            plt.gca().xaxis.set_major_formatter(mtick.PercentFormatter(xmax=1.0))
+            plt.grid(True, linestyle='--', alpha=0.6)
+            plt.legend(title="Method", bbox_to_anchor=(1.05, 1), loc='upper left')
+
+            path = f"{self.config.results_dir}/FigF_actual_sparsity_vs_performance.png"
+            plt.tight_layout()
+            plt.savefig(path, dpi=300, bbox_inches='tight')
+            plt.close()
+            return path
+    
     def _plot_causal_importance_distribution(self) -> str:
         """Figure C: Visualise the distribution of causal importance across layers."""
         if not self.importance_cache:
@@ -2575,6 +2639,20 @@ class ComprehensiveValidationFramework:
             if path: viz_paths["FigD_actual_vs_target"] = path
         except Exception as e:
             logger.warning(f"Failed to generate Figure D (Actual vs Target Sparsity): {e}")
+
+        # --- Figure E: Performance Heatmap ---
+        try:
+            path = self._plot_performance_heatmap(results_df, palette)
+            if path: viz_paths["FigE_performance_heatmap"] = path
+        except Exception as e:
+            logger.warning(f"Failed to generate Figure E (Heatmap): {e}")
+
+        # --- Figure F: Actual Sparsity vs Performance Scatter Plot ---
+        try:
+            path = self._plot_actual_sparsity_vs_performance(results_df, palette)
+            if path: viz_paths["FigF_sparsity_vs_performance"] = path
+        except Exception as e:
+            logger.warning(f"Failed to generate Figure F (Scatter Plot): {e}")
 
         # Reset style to default after generation
         plt.style.use('default')
