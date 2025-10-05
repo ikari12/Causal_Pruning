@@ -30,6 +30,7 @@ from scipy import stats
 from sklearn.metrics import accuracy_score, f1_score
 from tqdm import tqdm
 from joblib import Parallel, delayed 
+from tabulate import tabulate
 
 # Transformers imports
 # Note: Explicitly import model classes to prevent lazy loading issues.
@@ -1980,7 +1981,7 @@ class ComprehensiveValidationFramework:
             baseline_perf = results_df[results_df["sparsity"] == 0.0]["performance"].mean()
             plt.axhline(baseline_perf, color='gray', linestyle='--', alpha=0.7, label=f'Baseline Avg: {baseline_perf:.3f}')
 
-        plt.yscale('log') 
+        #plt.yscale('log') 
         plt.title("Performance vs. Sparsity Level (95% CI)")
         plt.xlabel("Sparsity")
         # Format x-axis as percentage
