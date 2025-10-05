@@ -708,6 +708,81 @@ class WandaWithCausalMasking:
         return self.model
         
 
+class WandaWithCausalMaskingGPU:
+    """GPU-optimized implementation of Wanda with Causal Masking."""
+    def __init__(self, model: nn.Module, causal_calculator: CausalImportanceCalculator):
+        self.model = model
+        self.device = next(model.parameters()).device
+        self.activations = {}
+
+    def _add_hooks(self):
+        """Adds forward hooks to capture input activations on the GPU."""
+        hooks = []
+        def hook_fn(name):
+            def hook(module, input_val, output):
+                if isinstance(input_val, tuple) and len(input_val) > 0:
+                    self.activations[name] = input_val[0]
+            return hook
+
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                hooks.append(module.register_forward_hook(hook_fn(name)))
+        return hooks
+
+    def prune_with_causal_masking(
+        self, inputs: Dict[str, torch.Tensor], causal_scores: Dict[str, torch.Tensor], sparsity: float
+    ) -> nn.Module:
+        logger.info("  -> Applying GPU-optimized Wanda w/ Causal Masking...")
+
+        sum_of_squares = {}
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                sum_of_squares[name] = torch.zeros(module.in_features, device=self.device)
+
+        hooks = self._add_hooks()
+        total_samples = next(iter(inputs.values())).shape[0]
+        
+        with torch.no_grad():
+            for i in tqdm(range(0, total_samples, BATCH_SIZE), desc="  -> Calculating Wanda scores", leave=False, ncols=100):
+                batch_inputs = {k: v[i:i + BATCH_SIZE].to(self.device) for k, v in inputs.items()}
+                self.model(**batch_inputs)
+
+                for name, acts in self.activations.items():
+                    if acts.dim() == 3: # (batch, seq_len, in_features)
+                        reshaped_acts = acts.view(-1, acts.shape[-1])
+                    else: # (batch, in_features)
+                        reshaped_acts = acts
+                    
+                    sum_of_squares[name] += torch.sum(reshaped_acts.float().pow(2), dim=0)
+                
+                self.activations.clear() 
+
+        for hook in hooks:
+            hook.remove()
+
+        if causal_scores:
+            all_causal_scores = torch.tensor(list(causal_scores.values()))
+            protection_quantile = sparsity * 0.8
+            protection_threshold = torch.quantile(all_causal_scores, protection_quantile)
+        else:
+            protection_threshold = float('inf')
+
+        for name, module in self.model.named_modules():
+            if name in sum_of_squares:
+                weights = module.weight.data
+                act_norms = torch.sqrt(sum_of_squares[name])
+                
+                score = torch.abs(weights) * act_norms.unsqueeze(0)
+                
+                if name in causal_scores and causal_scores[name] > protection_threshold:
+                    score *= 10.0 
+
+                threshold = torch.quantile(score.flatten(), sparsity)
+                mask = (score > threshold).float()
+                module.weight.data *= mask
+                
+        return self.model
+    
 class SparseGPTWithCausalMasking:
     """
     Implements a more faithful, data-driven version of SparseGPT,
@@ -813,6 +888,82 @@ class SparseGPTWithCausalMasking:
         
         return self.model
 
+
+class SparseGPTWithCausalMaskingGPU:
+    """GPU-optimized implementation of SparseGPT with Causal Masking."""
+    def __init__(self, model: nn.Module, causal_calculator: CausalImportanceCalculator):
+        self.model = model
+        self.device = next(model.parameters()).device
+        self.activations = {}
+
+    def _add_hooks(self):
+        """Adds forward hooks to capture input activations on the GPU."""
+        hooks = []
+        def hook_fn(name):
+            def hook(module, input_val, output):
+                if isinstance(input_val, tuple) and len(input_val) > 0:
+                    self.activations[name] = input_val[0]
+            return hook
+
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                hooks.append(module.register_forward_hook(hook_fn(name)))
+        return hooks
+
+    def prune_with_causal_masking(
+        self, inputs: Dict[str, torch.Tensor], causal_scores: Dict[str, torch.Tensor], sparsity: float
+    ) -> nn.Module:
+        logger.info("  -> Applying GPU-optimized SparseGPT w/ Causal Masking...")
+
+        H_diag_accumulators = {}
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                H_diag_accumulators[name] = torch.zeros(module.in_features, device=self.device)
+        
+        hooks = self._add_hooks()
+        total_samples = next(iter(inputs.values())).shape[0]
+
+        with torch.no_grad():
+            for i in tqdm(range(0, total_samples, BATCH_SIZE), desc="  -> Calculating SparseGPT scores", leave=False, ncols=100):
+                batch_inputs = {k: v[i:i + BATCH_SIZE].to(self.device) for k, v in inputs.items()}
+                self.model(**batch_inputs)
+
+                for name, acts in self.activations.items():
+                    if acts.dim() == 3:
+                        reshaped_acts = acts.view(-1, acts.shape[-1])
+                    else:
+                        reshaped_acts = acts
+                    
+                    H_diag_accumulators[name] += torch.sum(reshaped_acts.float().pow(2), dim=0)
+                
+                self.activations.clear() 
+
+        for hook in hooks:
+            hook.remove()
+
+        if causal_scores:
+            all_causal_scores = torch.tensor(list(causal_scores.values()))
+            protection_quantile = sparsity * 0.8
+            protection_threshold = torch.quantile(all_causal_scores, protection_quantile)
+        else:
+            protection_threshold = float('inf')
+
+        for name, module in self.model.named_modules():
+            if name in H_diag_accumulators:
+                weights = module.weight.data
+                H_diag = 2 * H_diag_accumulators[name]
+                
+                score = weights.pow(2) / (H_diag.unsqueeze(0) + 1e-8)
+                
+                if name in causal_scores and causal_scores[name] > protection_threshold:
+                    score *= 10.0 
+
+                threshold = torch.quantile(score.flatten(), sparsity)
+                mask = (score > threshold).float()
+                module.weight.data *= mask
+
+        return self.model
+    
 class WandaPruner:
     """
     Implements the Wanda pruning method rigorously, following the original paper.
@@ -896,6 +1047,69 @@ class WandaPruner:
                 
         return self.model
 
+class WandaPrunerGPU:
+    """GPU-optimized implementation of Wanda pruning."""
+    def __init__(self, model: nn.Module):
+        self.model = model
+        self.device = next(model.parameters()).device
+        self.activations = {}
+
+    def _add_hooks(self):
+        """Adds forward hooks to capture input activations."""
+        hooks = []
+        def hook_fn(name):
+            def hook(module, input_val, output):
+                if isinstance(input_val, tuple) and len(input_val) > 0:
+                    self.activations[name] = input_val[0]
+            return hook
+
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                hooks.append(module.register_forward_hook(hook_fn(name)))
+        return hooks
+
+    def prune(self, inputs: Dict[str, torch.Tensor], sparsity: float) -> nn.Module:
+        logger.info("  -> Applying GPU-optimized Wanda pruning...")
+        
+        sum_of_squares = {}
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                sum_of_squares[name] = torch.zeros(module.in_features, device=self.device)
+
+        hooks = self._add_hooks()
+        total_samples = next(iter(inputs.values())).shape[0]
+        
+        with torch.no_grad():
+            for i in tqdm(range(0, total_samples, BATCH_SIZE), desc="  -> Calculating Wanda scores", leave=False, ncols=100):
+                batch_inputs = {k: v[i:i + BATCH_SIZE].to(self.device) for k, v in inputs.items()}
+                self.model(**batch_inputs)
+
+                for name, acts in self.activations.items():
+                    if acts.dim() == 3: # (batch, seq_len, in_features)
+                        reshaped_acts = acts.view(-1, acts.shape[-1])
+                    else: # (batch, in_features)
+                        reshaped_acts = acts
+                    
+                    sum_of_squares[name] += torch.sum(reshaped_acts.float().pow(2), dim=0)
+                
+                self.activations.clear()
+
+        for hook in hooks:
+            hook.remove()
+
+        for name, module in self.model.named_modules():
+            if name in sum_of_squares:
+                weights = module.weight.data
+                act_norms = torch.sqrt(sum_of_squares[name])
+                
+                scores = torch.abs(weights) * act_norms.unsqueeze(0)
+                
+                threshold = torch.quantile(scores.flatten(), sparsity)
+                mask = (scores > threshold).float()
+                module.weight.data *= mask
+                
+        return self.model
+    
 class SparseGPTPruner:
     """
     Implements a more faithful, data-driven version of SparseGPT.
@@ -982,6 +1196,69 @@ class SparseGPTPruner:
         return self.model
     
 
+class SparseGPTPrunerGPU:
+    """GPU-optimized implementation of SparseGPT-like pruning."""
+    def __init__(self, model: nn.Module):
+        self.model = model
+        self.device = next(model.parameters()).device
+        self.activations = {}
+
+    def _add_hooks(self):
+        """Adds forward hooks to capture input activations."""
+        hooks = []
+        def hook_fn(name):
+            def hook(module, input_val, output):
+                if isinstance(input_val, tuple) and len(input_val) > 0:
+                    self.activations[name] = input_val[0]
+            return hook
+
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                hooks.append(module.register_forward_hook(hook_fn(name)))
+        return hooks
+
+    def prune(self, inputs: Dict[str, torch.Tensor], sparsity: float) -> nn.Module:
+        logger.info("  -> Applying GPU-optimized SparseGPT-like pruning...")
+
+        H_diag_accumulators = {}
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                H_diag_accumulators[name] = torch.zeros(module.in_features, device=self.device)
+        
+        hooks = self._add_hooks()
+        total_samples = next(iter(inputs.values())).shape[0]
+
+        with torch.no_grad():
+            for i in tqdm(range(0, total_samples, BATCH_SIZE), desc="  -> Calculating SparseGPT scores", leave=False, ncols=100):
+                batch_inputs = {k: v[i:i + BATCH_SIZE].to(self.device) for k, v in inputs.items()}
+                self.model(**batch_inputs)
+
+                for name, acts in self.activations.items():
+                    if acts.dim() == 3:
+                        reshaped_acts = acts.view(-1, acts.shape[-1])
+                    else:
+                        reshaped_acts = acts
+                    
+                    H_diag_accumulators[name] += torch.sum(reshaped_acts.float().pow(2), dim=0)
+                
+                self.activations.clear()
+
+        for hook in hooks:
+            hook.remove()
+
+        for name, module in self.model.named_modules():
+            if name in H_diag_accumulators:
+                weights = module.weight.data
+                H_diag = 2 * H_diag_accumulators[name]
+                
+                scores = weights.pow(2) / (H_diag.unsqueeze(0) + 1e-8)
+                
+                threshold = torch.quantile(scores.flatten(), sparsity)
+                mask = (scores > threshold).float()
+                module.weight.data *= mask
+
+        return self.model
+    
 # ============================================================================
 # Evaluation Framework
 # ============================================================================
@@ -1667,6 +1944,79 @@ class ComprehensiveValidationFramework:
 
         return pruner.model
 
+    def _apply_hierarchical_pruning_gpu(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, torch.Tensor],
+        causal_scores: Dict[str, torch.Tensor],
+        sparsity: float,
+        base_method: str = "Wanda"
+    ) -> nn.Module:
+        """
+        GPU-optimized version of hierarchical pruning.
+        Applies pruning only within causally important modules.
+        """
+        logger.info(f"  -> Applying GPU-optimized Hierarchical Causal Pruning with base method: {base_method}...")
+        device = next(model.parameters()).device
+
+        protected_modules = set()
+        if causal_scores:
+            all_causal_scores = torch.tensor(list(causal_scores.values()))
+            protection_threshold = torch.quantile(all_causal_scores, sparsity) 
+            for name, score in causal_scores.items():
+                if score > protection_threshold:
+                    protected_modules.add(name)
+        
+        if not protected_modules:
+            logger.warning("No modules identified for hierarchical pruning. Returning original model.")
+            return model
+        logger.info(f"     Pruning will be applied inside these {len(protected_modules)} modules.")
+
+        sum_of_squares = {name: torch.zeros(module.in_features, device=device)
+                          for name, module in model.named_modules() if isinstance(module, nn.Linear)}
+        
+        activations = {}
+        def hook_fn(name):
+            def hook(module, input_val, output):
+                activations[name] = input_val[0]
+            return hook
+
+        hooks = [module.register_forward_hook(hook_fn(name))
+                 for name, module in model.named_modules() if isinstance(module, nn.Linear)]
+
+        total_samples = next(iter(inputs.values())).shape[0]
+        with torch.no_grad():
+            for i in tqdm(range(0, total_samples, BATCH_SIZE), desc="  -> Calculating scores", leave=False, ncols=100):
+                batch_inputs = {k: v[i:i + BATCH_SIZE].to(device) for k, v in inputs.items()}
+                model(**batch_inputs)
+
+                for name, acts in activations.items():
+                    reshaped_acts = acts.view(-1, acts.shape[-1]) if acts.dim() == 3 else acts
+                    sum_of_squares[name] += torch.sum(reshaped_acts.float().pow(2), dim=0)
+                activations.clear()
+
+        for hook in hooks:
+            hook.remove()
+
+        for name, module in model.named_modules():
+            if name in protected_modules:
+                weights = module.weight.data
+                
+                if base_method == "Wanda":
+                    act_norms = torch.sqrt(sum_of_squares[name])
+                    scores = torch.abs(weights) * act_norms.unsqueeze(0)
+                elif base_method == "SparseGPT":
+                    H_diag = 2 * sum_of_squares[name]
+                    scores = weights.pow(2) / (H_diag.unsqueeze(0) + 1e-8)
+                else:
+                    continue
+
+                threshold = torch.quantile(scores.flatten(), sparsity)
+                mask = (scores > threshold).float()
+                module.weight.data *= mask
+        
+        return model
+    
     def _apply_pruning(
         self,
         model: nn.Module,
@@ -1740,34 +2090,34 @@ class ComprehensiveValidationFramework:
             return pruned_model
         
         elif method == "Wanda":
-            pruner = WandaPruner(pruned_model)
+            pruner = WandaPrunerGPU(pruned_model)
             return pruner.prune(inputs, sparsity)
         
         elif method == "SparseGPT":
-            pruner = SparseGPTPruner(pruned_model)
+            pruner = SparseGPTPrunerGPU(pruned_model)
             return pruner.prune(inputs, sparsity)
 
         elif method == "CausalMaskedWanda":
-            wanda_pruner = WandaWithCausalMasking(pruned_model, None)
+            wanda_pruner = WandaWithCausalMaskingGPU(pruned_model, None)
             scores = wanda_pruner.compute_wanda_scores(inputs, causal_scores, sparsity)
             return wanda_pruner._apply_structured_pruning(scores, sparsity)
 
         # --- ▼▼▼ THIS IS THE CORRECTED BLOCK ▼▼▼ ---
         elif method == "CausalMaskedSparseGPT":
             # The causal_calculator is not directly needed if we pass scores, so pass None.
-            sparse_pruner = SparseGPTWithCausalMasking(pruned_model, None)
+            sparse_pruner = SparseGPTWithCausalMaskingGPU(pruned_model, None)
             
             # The prune_with_causal_masking method now correctly receives all its arguments.
             return sparse_pruner.prune_with_causal_masking(inputs, causal_scores, sparsity)
         # --- ▲▲▲ END OF CORRECTION ▲▲▲ ---
 
         elif method == "HierarchicalCausalWanda":
-            return self._apply_hierarchical_pruning(
+            return self._apply_hierarchical_pruning_gpu(
                 pruned_model, inputs, causal_scores, sparsity, base_method="Wanda"
             )
 
         elif method == "HierarchicalCausalSparseGPT":
-            return self._apply_hierarchical_pruning(
+            return self._apply_hierarchical_pruning_gpu(
                 pruned_model, inputs, causal_scores, sparsity, base_method="SparseGPT"
             )
         
