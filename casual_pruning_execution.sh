@@ -15,7 +15,7 @@ rm -f ./results/*
 # This is the primary command to run the experiment.
 docker run \
   --gpus all \
-  -e CUDA_VISIBLE_DEVICES="1,2,3" \
+  -e CUDA_VISIBLE_DEVICES="2,3" \
   -v "$(pwd)/results:/app/results" \
   causal-pruning
 

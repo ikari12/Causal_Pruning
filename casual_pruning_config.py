@@ -43,7 +43,7 @@ from transformers import (
     RobertaForSequenceClassification,
     RobertaModel,
 )
-
+BATCH_SIZE = 64
 
 warnings.filterwarnings('ignore')
 
@@ -627,7 +627,7 @@ class WandaWithCausalMasking:
         return wanda_scores
 
     def _get_activations(
-        self, inputs: Dict[str, torch.Tensor], batch_size: int = 8
+        self, inputs: Dict[str, torch.Tensor], batch_size: int = BATCH_SIZE
     ) -> Dict[str, torch.Tensor]:
         """
         Extract INPUT activations from model layers using batch processing.
@@ -720,7 +720,7 @@ class SparseGPTWithCausalMasking:
         self.causal_calculator = causal_calculator # Used for causal masking
         self.activations = {}
 
-    def _capture_activations(self, inputs: Dict[str, torch.Tensor], batch_size: int = 16):
+    def _capture_activations(self, inputs: Dict[str, torch.Tensor], batch_size: int = BATCH_SIZE):
         """Captures input activations required to compute the data-driven Hessian."""
         self.activations.clear()
         device = self.model.device
@@ -822,7 +822,7 @@ class WandaPruner:
         self.model = model
         self.activations = {}
 
-    def _capture_activations(self, inputs: Dict[str, torch.Tensor], batch_size: int = 16):
+    def _capture_activations(self, inputs: Dict[str, torch.Tensor], batch_size: int = BATCH_SIZE):
         """
         Runs a forward pass to capture input activations for each linear layer,
         processing in batches to conserve memory.
@@ -906,7 +906,7 @@ class SparseGPTPruner:
         self.model = model
         self.activations = {}
 
-    def _capture_activations(self, inputs: Dict[str, torch.Tensor], batch_size: int = 16):
+    def _capture_activations(self, inputs: Dict[str, torch.Tensor], batch_size: int = BATCH_SIZE):
         """
         Captures input activations, similar to the Wanda pruner.
         This is necessary to compute the data-driven Hessian.
@@ -1492,6 +1492,10 @@ class ComprehensiveValidationFramework:
                 model, tokeniser, dataset_config, pruning_config
             )
             
+            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            nonzero_params = sum(torch.count_nonzero(p).item() for p in model.parameters() if p.requires_grad)
+            actual_sparsity = 1.0 - (nonzero_params / total_params)
+
             result = {
                 "model": model_config.name,
                 "dataset": dataset_config.name,
@@ -1499,6 +1503,8 @@ class ComprehensiveValidationFramework:
                 "pruning_method": pruning_config.method_name,
                 "sparsity": sparsity,
                 "run": run,
+                "target_sparsity": sparsity, 
+                "actual_sparsity": actual_sparsity, 
                 "performance": eval_results.get(dataset_config.metric, 0.0),
                 "additional_metrics": eval_results,
                 "timestamp": pd.Timestamp.now(),
@@ -1592,7 +1598,6 @@ class ComprehensiveValidationFramework:
             logger.error(f"Failed to load model {model_config.name}: {e}")
             raise
 
-
     def _apply_hierarchical_pruning(
         self,
         model: nn.Module,
@@ -1662,7 +1667,6 @@ class ComprehensiveValidationFramework:
 
         return pruner.model
 
-        
     def _apply_pruning(
         self,
         model: nn.Module,
@@ -1710,7 +1714,7 @@ class ComprehensiveValidationFramework:
             logger.info("  -> Applying Gradient pruning...")
             pruned_model.train()
 
-            batch_size = 16
+            batch_size = BATCH_SIZE
             total_samples = inputs['input_ids'].shape[0]
             pruned_model.zero_grad()
 
@@ -1910,8 +1914,7 @@ class ComprehensiveValidationFramework:
             "experiment_config": self.config,
             "total_experiments": len(results_df),
             "completion_time": pd.Timestamp.now()
-        }
-    
+        } 
 
     def _generate_performance_summary(
         self, results_df: pd.DataFrame
@@ -2122,6 +2125,64 @@ class ComprehensiveValidationFramework:
         plt.close()
         return path
     
+    def _plot_actual_vs_target_sparsity(self, results_df: pd.DataFrame, palette) -> str:
+        """Figure D: Actual vs. Target Sparsity to show the effect of causal protection."""
+        plt.figure(figsize=(10, 6))
+
+        # Ensure the required columns exist
+        if "target_sparsity" not in results_df.columns or "actual_sparsity" not in results_df.columns:
+            logger.warning("Skipping 'Actual vs Target Sparsity' plot: required columns not found.")
+            return ""
+
+        # Define markers for better differentiation, consistent with other plots
+        methods = results_df["pruning_method"].unique()
+        markers = ["o", "s", "D", "^", "v", "<", ">", "p", "*", "h"]
+        if len(methods) > len(markers):
+            markers = markers * (len(methods) // len(markers) + 1)
+        marker_map = {method: markers[i] for i, method in enumerate(methods)}
+
+        # Main plot showing the relationship for each method
+        sns.lineplot(
+            data=results_df, 
+            x="target_sparsity", 
+            y="actual_sparsity", 
+            hue="pruning_method",
+            style="pruning_method", 
+            markers=marker_map, 
+            dashes=False, 
+            palette=palette,
+            errorbar=('ci', 95), 
+            linewidth=2, 
+            markersize=8
+        )
+
+        # Add a y=x diagonal reference line
+        # This line represents the ideal case where actual sparsity equals target sparsity
+        plt.axline([0, 0], [1, 1], color='red', linestyle='--', label='Ideal (y=x)')
+
+        # Formatting the plot for clarity
+        plt.title("Actual vs. Target Sparsity")
+        plt.xlabel("Target Sparsity")
+        plt.ylabel("Actual Measured Sparsity")
+        
+        # Format both axes as percentages for intuitive reading
+        plt.gca().xaxis.set_major_formatter(mtick.PercentFormatter(xmax=1.0))
+        plt.gca().yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1.0))
+        
+        # Ensure the plot limits are from 0 to 1 (or 0% to 100%)
+        plt.xlim(0, 1)
+        plt.ylim(0, 1)
+
+        plt.legend(title="Method", bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+        sns.despine()
+
+        # Save the figure
+        path = f"{self.config.results_dir}/FigD_actual_vs_target_sparsity.png"
+        plt.tight_layout()
+        plt.savefig(path, dpi=300, bbox_inches='tight')
+        plt.close()
+        return path
 
     def _generate_visualisations(
         self, results_df: pd.DataFrame
@@ -2157,6 +2218,13 @@ class ComprehensiveValidationFramework:
             if path: viz_paths["FigC_causal_distribution"] = path
         except Exception as e:
             logger.warning(f"Failed to generate Figure C (Causal Distribution): {e}")
+
+        # --- Figure D: Actual vs Target Sparsity ---
+        try:
+            path = self._plot_actual_vs_target_sparsity(results_df, palette)
+            if path: viz_paths["FigD_actual_vs_target"] = path
+        except Exception as e:
+            logger.warning(f"Failed to generate Figure D (Actual vs Target Sparsity): {e}")
 
         # Reset style to default after generation
         plt.style.use('default')
