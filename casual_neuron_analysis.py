@@ -24,9 +24,10 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # --- Analysis Parameters ---
 CALIBRATION_SAMPLES = 1400      # Number of sentences for analysis, as requested.
 ATTN_NEURON_BATCH_SIZE = 16     # How many attention dimensions to test in parallel. Adjust based on VRAM.
-FFN_NEURON_BATCH_SIZE = 64      # Batch size for FFN neurons can often be larger.
+FFN_NEURON_BATCH_SIZE = 16      # Batch size for FFN neurons can often be larger.
 TOP_K_NEURONS_GLOBAL = 200      # Analyse the top 200 most important neurons globally (from both attn and ffn).
 TOP_K_WORDS_FOR_LABEL = 3       # Number of words to use for labeling points on the plot.
+TOP_K_WORDS = 30 
 BATCH_SIZE = 32                 # General batch size for forward passes.
 RESULTS_DIR = "/app/results"
 
@@ -225,14 +226,16 @@ def run_neuron_cluster_analysis():
                 def hook(module, input, output): captured_activations[name] = output
                 return hook
 
-            embedding_name = "bert.embeddings.word_embeddings"
+            embedding_name = "embeddings.word_embeddings"
+            
             hooks = [
                 model.get_submodule(target_name).register_forward_hook(capture_hook(target_name)),
                 model.get_submodule(embedding_name).register_forward_hook(capture_hook(embedding_name))
             ]
             
             model(**calib_tokens)
-            for h in hooks: h.remove()
+            for handle in hooks: 
+                handle.remove()
             
             target_output = captured_activations[target_name]
             if isinstance(target_output, tuple): target_output = target_output[0]
@@ -246,8 +249,9 @@ def run_neuron_cluster_analysis():
             grads = torch.autograd.grad(outputs=objective, inputs=captured_activations[embedding_name])[0]
             token_attributions = torch.einsum("bsd,bsd->bs", grads, captured_activations[embedding_name]).flatten()
             
-            flat_tokens = tokenizer.convert_ids_to_tokens(calib_tokens.flatten())
-            df = pd.DataFrame({"token": flat_tokens, "attribution": token_attributions.cpu().numpy()})
+            flat_tokens = tokenizer.convert_ids_to_tokens(calib_tokens['input_ids'].flatten())
+    
+            df = pd.DataFrame({"token": flat_tokens, "attribution": token_attributions.detach().cpu().numpy()})
             df = df[df.token.isin(['[CLS]', '[SEP]', '[PAD]']) == False]
             agg_df = df.groupby('token')['attribution'].agg(['mean', 'count'])
             agg_df = agg_df[agg_df['count'] >= 2].sort_values(by='mean', ascending=False).head(TOP_K_WORDS)

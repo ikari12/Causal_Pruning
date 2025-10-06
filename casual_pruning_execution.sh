@@ -9,7 +9,7 @@
 # Uncomment the line below if you need to rebuild the Docker image.
 docker build -t causal-pruning .
 
-rm -f ./results/*
+#rm -f ./results/*
 
 # --- Main Execution Command ---
 # This is the primary command to run the experiment.
