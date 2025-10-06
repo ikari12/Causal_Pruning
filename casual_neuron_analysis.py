@@ -68,7 +68,7 @@ def run_neuron_cluster_analysis():
     model = AutoModel.from_pretrained(MODEL_NAME).to(DEVICE)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     
-    dataset = load_dataset(DATASET_PATH, DATASET_SUBSET, split="test", trust_remote_code=True)
+    dataset = load_dataset(DATASET_PATH, DATASET_SUBSET, split="train", trust_remote_code=True)
     calib_dataset = dataset.select(range(min(CALIBRATION_SAMPLES, len(dataset))))
     
     calib_texts = [ex['sentence1'] for ex in calib_dataset]
