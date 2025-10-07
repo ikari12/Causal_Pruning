@@ -1,6 +1,6 @@
 #
-# Script: hybrid_pruning.py (Corrected Version)
-# Purpose: To prune the model using the Hybrid Pruning strategy and evaluate it reliably.
+# Script: hybrid_pruning.py (Theoretically Aligned and Corrected Version)
+# Purpose: To prune the model using the Hybrid Pruning strategy (CC-Prune), ensuring complete protection of the Causal Circuit.
 #
 import torch
 import torch.nn as nn
@@ -8,7 +8,7 @@ import copy
 from transformers import AutoModel, AutoTokenizer
 import pandas as pd
 from pathlib import Path
-from tqdm import tqdm
+# from tqdm import tqdm # tqdmは使用されていませんが、インポートは残しておきます
 from mteb import MTEB
 import time
 import numpy as np
@@ -31,12 +31,17 @@ def report_sparsity(model: nn.Module, description: str):
     """Calculates and reports the parameter sparsity of the model."""
     total_params = 0
     nonzero_params = 0
+    # Include all parameters (weights and biases) that are typically trainable
     for param in model.parameters():
         if param.requires_grad:
             total_params += param.numel()
             nonzero_params += torch.count_nonzero(param).item()
     
-    sparsity = (1 - (nonzero_params / total_params)) * 100
+    if total_params == 0:
+        sparsity = 0.0
+    else:
+        sparsity = (1 - (nonzero_params / total_params)) * 100
+        
     print(f"--- Sparsity Report for: {description} ---")
     print(f"  Total parameters:     {total_params:,}")
     print(f"  Non-zero parameters:  {nonzero_params:,}")
@@ -68,29 +73,80 @@ def hybrid_prune_model(model: nn.Module, summary_df: pd.DataFrame, target_sparsi
     n_heads = model.config.num_attention_heads
     d_head = model.config.hidden_size // n_heads
     
+    # Initialize protection mask (True means prunable)
     for name, param in model.named_parameters():
         if param.requires_grad:
             protection_mask[name] = torch.ones_like(param, dtype=torch.bool)
             
+    # Update protection mask based on causal circuit (False means protected)
     for _, neuron in circuit_neurons.iterrows():
         layer, n_type = neuron['layer'], neuron['type']
         
         if n_type == 'ATTN':
             head, dim = neuron['head'], neuron['dim']
+            
+            # Indices for the specific neuron (V and O)
+            neuron_idx = head * d_head + dim
+            # Indices for the entire head (Q and K)
+            head_start_idx = head * d_head
+            head_end_idx = (head + 1) * d_head
+
+            # Rationale: To preserve the function of a neuron (H, D), we must protect:
+            # 1. Output path (W_O at dimension level).
+            # 2. Input Value (W_V, B_V at dimension level).
+            # 3. Attention Pattern (W_Q, B_Q, W_K, B_K at head level).
+
+            # ▼▼▼ FIX: Comprehensive Causal Circuit Protection for Attention ▼▼▼
+            
+            # 1. Protect W_O (Output projection) - Column
             w_o_name = f"encoder.layer.{layer}.attention.output.dense.weight"
-            start_col = head * d_head + dim
-            if start_col < protection_mask[w_o_name].shape[1]:
-                protection_mask[w_o_name][:, start_col] = False
+            if w_o_name in protection_mask and neuron_idx < protection_mask[w_o_name].shape[1]:
+                protection_mask[w_o_name][:, neuron_idx] = False
+            # Note: B_O (output bias) is typically protected entirely or pruned based on overall magnitude, 
+            # as it affects the entire layer output, not just this specific head/neuron. 
+            # We rely on magnitude pruning to handle B_O if it's not crucial overall.
+
+            # 2. Protect W_V and B_V (Value projection) - Row/Element (Neuron level)
+            w_v_name = f"encoder.layer.{layer}.attention.self.value.weight"
+            b_v_name = f"encoder.layer.{layer}.attention.self.value.bias"
+            if w_v_name in protection_mask and neuron_idx < protection_mask[w_v_name].shape[0]:
+                 protection_mask[w_v_name][neuron_idx, :] = False
+            # Protect Bias
+            if b_v_name in protection_mask and neuron_idx < protection_mask[b_v_name].shape[0]:
+                 protection_mask[b_v_name][neuron_idx] = False
+
+            # 3. Protect W_Q/B_Q and W_K/B_K (Query/Key projection) - Rows/Elements (Head level)
+            for proj_type in ['query', 'key']:
+                w_proj_name = f"encoder.layer.{layer}.attention.self.{proj_type}.weight"
+                b_proj_name = f"encoder.layer.{layer}.attention.self.{proj_type}.bias"
+                
+                if w_proj_name in protection_mask and head_end_idx <= protection_mask[w_proj_name].shape[0]:
+                    protection_mask[w_proj_name][head_start_idx:head_end_idx, :] = False
+                # Protect Bias
+                if b_proj_name in protection_mask and head_end_idx <= protection_mask[b_proj_name].shape[0]:
+                    protection_mask[b_proj_name][head_start_idx:head_end_idx] = False
+            # ▲▲▲ END FIX ▲▲▲
         
         elif n_type == 'FFN':
-            dim = neuron['dim']
-            w_in_name = f"encoder.layer.{layer}.intermediate.dense.weight"
-            if dim < protection_mask[w_in_name].shape[0]:
-                protection_mask[w_in_name][dim, :] = False
+            dim = neuron['dim'] # Index corresponding to the neuron
 
+            # ▼▼▼ FIX: Protect FFN Weights and Biases ▼▼▼
+            # 1. Protect W_in (intermediate.dense) and B_in
+            w_in_name = f"encoder.layer.{layer}.intermediate.dense.weight"
+            b_in_name = f"encoder.layer.{layer}.intermediate.dense.bias"
+            # Protect the row corresponding to the neuron input
+            if w_in_name in protection_mask and dim < protection_mask[w_in_name].shape[0]:
+                protection_mask[w_in_name][dim, :] = False
+            # Protect Bias
+            if b_in_name in protection_mask and dim < protection_mask[b_in_name].shape[0]:
+                protection_mask[b_in_name][dim] = False
+
+            # 2. Protect W_out (output.dense)
             w_out_name = f"encoder.layer.{layer}.output.dense.weight"
-            if dim < protection_mask[w_out_name].shape[1]:
+            # Protect the column corresponding to the neuron output
+            if w_out_name in protection_mask and dim < protection_mask[w_out_name].shape[1]:
                 protection_mask[w_out_name][:, dim] = False
+            # ▲▲▲ END FIX ▲▲▲
 
     # Phase 2: Hybrid Pruning
     prunable_params = []
@@ -98,37 +154,68 @@ def hybrid_prune_model(model: nn.Module, summary_df: pd.DataFrame, target_sparsi
     for name, param in model.named_parameters():
         if name in protection_mask:
             prunable_indices = protection_mask[name]
-            prunable_params.append(param.data[prunable_indices])
+            if prunable_indices.any():
+                prunable_params.append(param.data[prunable_indices])
             total_prunable_count += prunable_indices.sum().item()
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     num_protected_params = total_params - total_prunable_count
+    
+    # Calculate protection ratio
+    protection_ratio = (num_protected_params / total_params) * 100 if total_params > 0 else 0
+    
     print(f"Total parameters: {total_params:,}")
-    print(f"Protected (circuit) parameters: {num_protected_params:,}")
+    print(f"Protected (circuit) parameters: {num_protected_params:,} ({protection_ratio:.2f}%)")
     print(f"Prunable (non-circuit) parameters: {total_prunable_count:,}")
 
+    # Calculate the number of parameters to prune from the non-circuit part
     num_params_to_prune_total = int(total_params * target_sparsity)
     num_params_to_prune_from_non_circuit = num_params_to_prune_total
     
     if num_params_to_prune_from_non_circuit <= 0:
-        print("✅ No prunable parameters need to be removed to reach target sparsity.")
+        print("✅ No parameters need to be removed to reach target sparsity.")
         return model
+
+    if total_prunable_count == 0:
+        if num_params_to_prune_from_non_circuit > 0:
+             print("⚠️ Warning: No prunable parameters available, but target sparsity > 0. Cannot prune further.")
+        return model
+
     if num_params_to_prune_from_non_circuit > total_prunable_count:
-        print(f"⚠️ Warning: Target sparsity requires removing more parameters than available. Pruning all non-circuit parameters.")
+        print(f"⚠️ Warning: Target sparsity requires removing more parameters than available ({num_params_to_prune_from_non_circuit} > {total_prunable_count}). Pruning all non-circuit parameters.")
         num_params_to_prune_from_non_circuit = total_prunable_count
 
-    all_prunable_values = torch.cat([p.abs() for p in prunable_params])
-    threshold = torch.kthvalue(all_prunable_values, k=num_params_to_prune_from_non_circuit).values
+    # Determine the magnitude threshold for pruning
+    all_prunable_values = torch.cat([p.view(-1).abs() for p in prunable_params])
+    
+    # Find the k-th smallest value (k = number of elements to prune). This is the threshold.
+    # Ensure k is at least 1 if we need to prune anything, and capped at the total number of elements.
+    k = min(max(1, num_params_to_prune_from_non_circuit), all_prunable_values.numel())
+    threshold = torch.kthvalue(all_prunable_values, k=k).values
 
+    # Apply pruning (magnitude-based) only to non-circuit parameters
     with torch.no_grad():
         for name, param in model.named_parameters():
             if name in protection_mask:
+                # mask (protection_mask[name]) defines which elements are prunable (True)
                 mask = protection_mask[name]
-                param.data[mask] = param.data[mask] * (param.data[mask].abs() > threshold)
+                
+                if mask.any():
+                    # Apply magnitude threshold only to the prunable parts
+                    prunable_data = param.data[mask]
+                    # Create a mask for elements to keep (abs > threshold). 
+                    # Using > ensures we prune approximately k elements.
+                    keep_mask_prunable = prunable_data.abs() > threshold
+                    # Apply the mask: set pruned elements to 0 by multiplying with the keep mask (cast to float)
+                    param.data[mask] = prunable_data * keep_mask_prunable.float()
+
 
     print("✅ Hybrid Pruning complete.")
     return model
 
+# ============================================================================
+# 4. Evaluation Function (No major changes needed here, assuming it works reliably)
+# ============================================================================
 def evaluate_model(model_to_eval: nn.Module, tokenizer_to_use):
     """
     Evaluates the pruned model on the JSTS benchmark using a simple, robust MTEB wrapper.
@@ -159,7 +246,6 @@ def evaluate_model(model_to_eval: nn.Module, tokenizer_to_use):
                 ).to(self.model.device)
                 
                 model_output = self.model(**inputs)
-                
                 pooled_embeddings = self._mean_pooling(model_output, inputs['attention_mask'])
                 normalized_embeddings = F.normalize(pooled_embeddings, p=2, dim=1)
                 all_embeddings.append(normalized_embeddings.cpu())
@@ -169,15 +255,22 @@ def evaluate_model(model_to_eval: nn.Module, tokenizer_to_use):
     mteb_model = MTEBWrapper(model=model_to_eval, tokenizer=tokenizer_to_use)
     evaluation = MTEB(tasks=["JSTS"], task_langs=["ja"])
     
-    results = evaluation.run(mteb_model, output_folder=f"results/jsts_results", verbosity=1)
+    # Define output folder path appropriately
+    Path(RESULTS_DIR).mkdir(parents=True, exist_ok=True)
+    # Added timestamp to avoid conflicts if run multiple times quickly
+    output_folder_path = Path(RESULTS_DIR) / f"jsts_results_{int(time.time())}"
+    
+    # Specify eval_splits=["test"] to ensure evaluation runs on the test set
+    results = evaluation.run(mteb_model, output_folder=str(output_folder_path), verbosity=1, eval_splits=["test"])
     
     end_time = time.time()
     print(f"✅ Evaluation finished in {end_time - start_time:.2f} seconds.")
     
     try:
-        pearson_score = results["JSTS"]["test"]["cos_sim"]["pearson"]
+        # MTEB results are typically returned in a list for the requested tasks
+        pearson_score = results[0].scores["test"]["cos_sim"]["pearson"]
         return pearson_score
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, IndexError):
         print("⚠️ Could not extract Pearson score from evaluation results.")
         print("Full results:", results)
         return 0.0
@@ -199,7 +292,13 @@ if __name__ == "__main__":
     performance_results = []
     
     print("Loading original model and tokenizer...")
-    original_model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    # trust_remote_code=True might be needed depending on the model source/version
+    try:
+        original_model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    except Exception as e:
+        print(f"Could not load model with trust_remote_code=True, trying without. Error: {e}")
+        original_model = AutoModel.from_pretrained(MODEL_NAME)
+        
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     print("✅ Model and tokenizer loaded.")
 
@@ -208,6 +307,7 @@ if __name__ == "__main__":
         print(f"PROCESSING TARGET SPARSITY: {sparsity*100:.0f}%")
         print("="*60)
 
+        # Deepcopy the model to ensure isolation between pruning runs
         model_to_prune = copy.deepcopy(original_model).to(DEVICE)
         pruned_model = hybrid_prune_model(model_to_prune, neuron_summary_df.copy(), sparsity, CIRCUIT_RETENTION_RATIO)
         
@@ -219,6 +319,11 @@ if __name__ == "__main__":
             "actual_sparsity": f"{actual_sparsity:.2f}%",
             "jsts_pearson_score": f"{score:.4f}",
         })
+        
+        # Clean up memory
+        del model_to_prune, pruned_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     print("\n\n" + "="*60)
     print("📊 FINAL PERFORMANCE REPORT")
