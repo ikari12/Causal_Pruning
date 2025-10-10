@@ -8,7 +8,6 @@ import copy
 from transformers import AutoModel, AutoTokenizer
 import pandas as pd
 from pathlib import Path
-# from tqdm import tqdm # tqdmは使用されていませんが、インポートは残しておきます
 from mteb import MTEB
 import time
 import numpy as np
@@ -58,7 +57,7 @@ def hybrid_prune_model(model: nn.Module, summary_df: pd.DataFrame, target_sparsi
     Phase 1: Protect the "causal circuit".
     Phase 2: Prune unprotected parameters by magnitude.
     """
-    if not 0 <= target_sparsity < 1:
+    if not 0 <= target_sparsity <= 1:
         raise ValueError(f"Target sparsity must be between 0 and 1, but got {target_sparsity}")
     
     print(f"✂️ Starting Hybrid Pruning for {target_sparsity*100:.1f}% target sparsity...")
@@ -253,25 +252,23 @@ def evaluate_model(model_to_eval: nn.Module, tokenizer_to_use):
             return torch.cat(all_embeddings, dim=0)
 
     mteb_model = MTEBWrapper(model=model_to_eval, tokenizer=tokenizer_to_use)
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning)
+    
     evaluation = MTEB(tasks=["JSTS"], task_langs=["ja"])
     
-    # Define output folder path appropriately
-    Path(RESULTS_DIR).mkdir(parents=True, exist_ok=True)
-    # Added timestamp to avoid conflicts if run multiple times quickly
-    output_folder_path = Path(RESULTS_DIR) / f"jsts_results_{int(time.time())}"
+    output_folder_path = Path(RESULTS_DIR) / f"jsts_results_ccprune_{int(time.time())}"
     
-    # Specify eval_splits=["test"] to ensure evaluation runs on the test set
-    results = evaluation.run(mteb_model, output_folder=str(output_folder_path), verbosity=1, eval_splits=["test"])
+    results = evaluation.run(mteb_model, output_folder=str(output_folder_path), verbosity=1, eval_splits=["validation"])
     
     end_time = time.time()
     print(f"✅ Evaluation finished in {end_time - start_time:.2f} seconds.")
     
     try:
-        # MTEB results are typically returned in a list for the requested tasks
-        pearson_score = results[0].scores["test"]["cos_sim"]["pearson"]
+        pearson_score = results[0].scores["validation"][0]["pearson"]
         return pearson_score
-    except (KeyError, TypeError, IndexError):
-        print("⚠️ Could not extract Pearson score from evaluation results.")
+    except (KeyError, TypeError, IndexError) as e:
+        print(f"⚠️ Could not extract Pearson score. Error: {e}")
         print("Full results:", results)
         return 0.0
 
@@ -288,7 +285,7 @@ if __name__ == "__main__":
     print("✅ Causal score data loaded.")
 
     CIRCUIT_RETENTION_RATIO = 0.3
-    TARGET_SPARSITY_LEVELS = [i / 10.0 for i in range(1, 10)] # 10% to 90%
+    TARGET_SPARSITY_LEVELS = [i / 100.0 for i in range(101)]
     performance_results = []
     
     print("Loading original model and tokenizer...")
@@ -331,3 +328,4 @@ if __name__ == "__main__":
     
     results_df = pd.DataFrame(performance_results)
     print(results_df.to_string(index=False))
+    results_df.to_csv(Path(RESULTS_DIR) / f"hybrid_pruning_results_{sane_model_name}.csv", index=False)

@@ -14,7 +14,7 @@ from tqdm import tqdm
 MODEL_ID = "cl-nagoya/ruri-base-v2"
 DATASET_ID = "sbintuitions/JMTEB"
 DATASET_SUBSET = "jsts"
-RESULTS_DIR = Path("./pruning_results")
+RESULTS_DIR = Path("/app/results")
 NUM_CALIBRATION_SAMPLES = 128
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # --- End of Configuration ---

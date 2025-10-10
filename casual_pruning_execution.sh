@@ -7,7 +7,7 @@
 
 # --- Build Command (if needed) ---
 # Uncomment the line below if you need to rebuild the Docker image.
-docker build -t causal-pruning .
+docker build -f Dockerfile_CWP -t causal-pruning .
 
 #rm -f ./results/*
 
@@ -17,11 +17,15 @@ docker run \
   --gpus all \
   -e CUDA_VISIBLE_DEVICES="2,3" \
   -v "$(pwd)/results:/app/results" \
-  causal-pruning
+  causal-pruning \
+  python3 casual_active_pruning.py
 
-# --- Notes on other execution modes (for reference) ---
-# The command above will run the default 'demo' mode.
-# To run other modes, you would typically override the command like this:
-#
-# docker run ... causal-pruning python3 casual_pruning_execution.py --mode standard --models 4 --datasets 15
-# docker run ... causal-pruning python3 casual_pruning_execution.py --mode full
+docker run \
+  --gpus all \
+  -e CUDA_VISIBLE_DEVICES="2,3" \
+  -v "$(pwd)/results:/app/results" \
+  causal-pruning \
+  python3 casual_wanda_pruning.py
+
+docker image prune -a --force
+docker container prune --force

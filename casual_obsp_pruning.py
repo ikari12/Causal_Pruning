@@ -1,6 +1,6 @@
-# FILE: complete_obsp_pruning.py
-# PURPOSE: To prune a model using the Optimal Brain Surgeon (OBS) method,
-# which is the foundational algorithm for SparseGPT, and evaluate its performance.
+# FILE: complete_obsp_pruning_experiment.py
+# PURPOSE: To run pruning experiments using the Optimal Brain Surgeon (OBS) method
+#          across multiple sparsity levels and generate a summary table.
 
 import torch
 from transformers import AutoModel, AutoTokenizer
@@ -9,6 +9,13 @@ from pathlib import Path
 from mteb import MTEB
 import torch.nn.functional as F
 from sparseml.transformers.pruning import OBSPruner, PruningConfig
+import warnings
+import copy
+import pandas as pd
+import re
+
+# Suppress all UserWarnings from the script.
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- Configuration ---
 MODEL_ID = "cl-nagoya/ruri-base-v2"
@@ -16,7 +23,8 @@ DATASET_ID = "sbintuitions/JMTEB"
 DATASET_SUBSET = "jsts"
 RESULTS_DIR = Path("./pruning_results")
 NUM_CALIBRATION_SAMPLES = 128
-TARGET_SPARSITY = 0.5  # Target 50% sparsity.
+# Define the range of target sparsity levels for the experiment.
+TARGET_SPARSITY_LEVELS = [i / 100.0 for i in range(101)]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # --- End of Configuration ---
 
@@ -51,85 +59,142 @@ class MTEBWrapper:
 
 
 def evaluate_model_on_jsts(model, tokenizer, description):
-    """Evaluates a given model on the JSTS benchmark."""
+    """Evaluates a given model on the JSTS benchmark with anti-caching."""
     print(f"\n🚀 Evaluating {description} on JSTS...")
     mteb_model = MTEBWrapper(model=model, tokenizer=tokenizer)
     evaluation = MTEB(tasks=["JSTS"], task_langs=["ja"])
-    results = evaluation.run(mteb_model, output_folder=RESULTS_DIR / "jsts_eval_obsp", verbosity=1, eval_splits=["test"])
-    pearson_score = results[0].scores["test"]["cos_sim"]["pearson"]
+    
+    # Create a unique output folder for each evaluation run to prevent caching.
+    safe_desc = re.sub(r'[^a-zA-Z0-9_-]', '_', description)
+    output_path = RESULTS_DIR / f"jsts_eval_obsp_{safe_desc}"
+    print(f"Using unique output folder to prevent caching: {output_path}")
+    
+    results = evaluation.run(mteb_model, output_folder=output_path, verbosity=0, eval_splits=["validation"])
+    
+    # Correctly parse the results dictionary.
+    pearson_score = results[0].scores["validation"][0]["pearson"]
     print(f"✅ JSTS Pearson Score for {description}: {pearson_score:.4f}")
     return pearson_score
 
 
 def report_sparsity(model):
-    """Calculates and reports the sparsity of the model."""
+    """Calculates and reports the sparsity of the model, returning the ratio."""
     total_params, zero_params = 0, 0
     for param in model.parameters():
         if param.requires_grad:
             total_params += param.numel()
             zero_params += (param.data == 0).sum().item()
-    sparsity = (zero_params / total_params) * 100 if total_params > 0 else 0
-    print(f"Model Sparsity: {sparsity:.2f}% ({zero_params:,} / {total_params:,} zero parameters)")
+    sparsity = (zero_params / total_params) if total_params > 0 else 0
+    print(f"Model Sparsity: {sparsity*100:.2f}%")
     return sparsity
+
+
+def print_results_table(results_data, baseline_score):
+    """Formats and prints the final results in a pandas DataFrame and a LaTeX table."""
+    df = pd.DataFrame(results_data)
+    df['retention'] = (df['score'] / baseline_score) * 100
+    
+    print("\n\n" + "="*80)
+    print("📊 EXPERIMENT SUMMARY (OBS PRUNING)")
+    print("="*80)
+    print(df.to_string(index=False, formatters={
+        'target_sparsity': '{:.0%}'.format,
+        'actual_sparsity': '{:.2%}'.format,
+        'score': '{:.4f}'.format,
+        'retention': '{:.2f}%'.format
+    }))
+    print("\n\n" + "="*80)
+    print("📋 LATEX TABLE FOR PUBLICATION (OBS PRUNING)")
+    print("="*80)
+    
+    print("\\begin{table}[h]")
+    print("\\centering")
+    print("\\caption{Performance of OBS Pruning across various target sparsity levels.}")
+    print("\\label{tab:obs_results}")
+    print("\\begin{tabular}{@{}cccc@{}}")
+    print("\\toprule")
+    print("Target Sparsity ($s$) & Actual Sparsity ($s_{\\text{actual}}$) & JSTS Pearson Score ($\\MB$) & Performance Retention \\\\")
+    print("\\midrule")
+    
+    print(f"0\\% (Baseline) & 0.00\\% & {baseline_score:.4f} & 100.00\\% \\\\")
+    
+    for res in results_data:
+        target_s = res['target_sparsity'] * 100
+        actual_s = res['actual_sparsity'] * 100
+        score = res['score']
+        retention = (score / baseline_score) * 100
+        print(f"{target_s:.0f}\\% & {actual_s:.2f}\\% & {score:.4f} & {retention:.2f}\\% \\\\")
+        
+    print("\\bottomrule")
+    print("\\end{tabular}")
+    print("\\end{table}")
+    print("="*80)
 
 
 def main():
     """
-    Main function to execute the OBS pruning and evaluation process.
+    Main function to execute the OBS pruning experiment.
     """
-    print("--- SPARSEGPT-EQUIVALENT (OBS) PRUNING SCRIPT ---")
+    print("--- SPARSEGPT-EQUIVALENT (OBS) PRUNING EXPERIMENT SCRIPT ---")
     RESULTS_DIR.mkdir(exist_ok=True)
-    sane_model_name = MODEL_ID.replace('/', '_')
 
-    # 1. Load the model and tokenizer.
-    print(f"Loading model: {MODEL_ID}")
-    model = AutoModel.from_pretrained(MODEL_ID).to(DEVICE)
+    # 1. Load original model, tokenizer, and calibration data.
+    print(f"Loading original model: {MODEL_ID}")
+    original_model = AutoModel.from_pretrained(MODEL_ID).to(DEVICE)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     
-    # 2. Evaluate the baseline model.
-    evaluate_model_on_jsts(model, tokenizer, "Baseline Model")
-    report_sparsity(model)
-
-    # 3. Prepare calibration data.
     print(f"\nLoading calibration data from {DATASET_ID} ({DATASET_SUBSET})...")
     dataset = load_dataset(DATASET_ID, DATASET_SUBSET, split="train", trust_remote_code=True)
     texts = [ex['sentence1'] for ex in dataset] + [ex['sentence2'] for ex in dataset]
     calibration_texts = texts[:NUM_CALIBRATION_SAMPLES]
-    # Create a simple dataloader.
     calibration_data = [
         tokenizer(text, return_tensors="pt") for text in calibration_texts if text.strip() != ""
     ]
 
-    # 4. Configure and run the OBS pruner.
-    print(f"Configuring OBS pruner for {TARGET_SPARSITY*100:.1f}% target sparsity...")
-    pruning_config = PruningConfig.optimal_brain_surgeon(
-        sparsity=TARGET_SPARSITY,
-    )
-    pruner = OBSPruner(config=pruning_config)
-
-    # Score weights (calculates importance and Hessian information).
-    print("Scoring weights with OBS method...")
-    pruner.score_weights(
-        model=model,
-        dataloader=calibration_data,
-        device=DEVICE,
-    )
-
-    # Prune the model (this also performs the weight updates).
-    print("Pruning model and updating remaining weights...")
-    pruner.prune()
+    # 2. Evaluate the baseline model to get the reference score.
+    baseline_score = evaluate_model_on_jsts(original_model, tokenizer, "Baseline Model")
     
-    print("✅ OBS pruning complete.")
+    experiment_results = []
+    
+    # 3. Loop through all target sparsity levels.
+    for target_sparsity in TARGET_SPARSITY_LEVELS:
+        print("\n" + "-"*60)
+        print(f"Processing Target Sparsity: {target_sparsity*100:.0f}%")
+        print("-"*60)
+        
+        # Always start from a fresh copy of the original model.
+        model_to_prune = copy.deepcopy(original_model).to(DEVICE)
+        
+        # Configure and run the OBS pruner for the current sparsity level.
+        pruning_config = PruningConfig.optimal_brain_surgeon(sparsity=target_sparsity)
+        pruner = OBSPruner(config=pruning_config)
 
-    # 5. Evaluate the pruned model.
-    evaluate_model_on_jsts(model, tokenizer, "OBS Pruned Model")
-    report_sparsity(model)
+        print("Scoring weights with OBS method...")
+        pruner.score_weights(model=model_to_prune, dataloader=calibration_data, device=DEVICE)
 
-    # Save the pruned model (optional).
-    pruned_model_path = RESULTS_DIR / f"{sane_model_name}-obsp-pruned"
-    model.save_pretrained(pruned_model_path)
-    tokenizer.save_pretrained(pruned_model_path)
-    print(f"\nPruned model saved to: {pruned_model_path}")
+        print("Pruning model and updating remaining weights...")
+        pruner.prune()
+        
+        print("✅ OBS pruning complete.")
+        
+        # Evaluate and report actual sparsity.
+        actual_sparsity = report_sparsity(model_to_prune)
+        score = evaluate_model_on_jsts(model_to_prune, tokenizer, f"Pruned Model ({target_sparsity*100:.0f}%)")
+        
+        # Store results.
+        experiment_results.append({
+            'target_sparsity': target_sparsity,
+            'actual_sparsity': actual_sparsity,
+            'score': score,
+        })
+        
+        # Clean up memory.
+        del model_to_prune, pruner
+        if DEVICE == 'cuda':
+            torch.cuda.empty_cache()
+
+    # 4. Print the final summary table.
+    print_results_table(experiment_results, baseline_score)
 
 
 if __name__ == "__main__":
