@@ -199,7 +199,7 @@ def main():
             torch.cuda.empty_cache()
 
     print_results_table(experiment_results, baseline_score)
-    experiment_results.to_csv(RESULTS_DIR / f"wanda_pruning_results_{sane_model_name}.csv", index=False)
+    pd.DataFrame(experiment_results).to_csv(RESULTS_DIR / f"wanda_pruning_results_{sane_model_name}.csv", index=False)
 
 
 if __name__ == "__main__":
