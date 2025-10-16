@@ -13,6 +13,8 @@ import time
 import numpy as np
 import torch.nn.functional as F
 
+import warnings
+warnings.filterwarnings("ignore", message=".*model_card_data.*")
 
 # ============================================================================
 # 1. Configuration
