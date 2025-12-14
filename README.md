@@ -1,421 +1,109 @@
-# Causal Intervention-Based Transformer Compression Framework
+# Causal Circuit-Guided Pruning (CC-Prune)
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-orange.svg)](https://pytorch.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
+This repository contains the official implementation and reproduction scripts for **"Causal Circuit-Guided Pruning: A Principled Framework for Functionality-Preserving Compression of Transformers"**.
 
-A comprehensive framework for implementing and validating causal intervention-based structural compression of Transformer models. This project provides a rigorous implementation of causal importance metrics to overcome spurious correlations in neural network pruning.
+We introduce **CC-Prune**, a method that identifies and protects causally important computational circuits via activation patching, allowing for high-sparsity model compression without catastrophic performance degradation. This framework is compared against state-of-the-art baselines such as **Wanda**.
 
-## 🎯 Overview
+## 📂 Directory Structure
 
-This framework implements the theoretical foundations presented in "Causal Intervention-Based Structural Compression of Transformers: A Theoretical Framework for Overcoming Spurious Correlations in Neural Network Pruning" with comprehensive empirical validation.
+```text
+.
+├── Dockerfile_CWP               # Docker configuration for the experimental environment
+├── casual_pruning_execution.sh  # Main execution script (Builds Docker & runs experiments)
+├── casual_active_scoring.py     # [Step 1] Calculates causal importance via Activation Patching
+├── casual_active_pruning.py     # [Step 2] Performs CC-Prune using scores from Step 1
+├── casual_active_visualize.py   # [Step 3] Generates heatmaps and score plots
+├── casual_wanda_scoring.py      # [Baseline Step 1] Calculates Wanda importance scores
+├── casual_wanda_pruning.py      # [Baseline Step 2] Performs Wanda pruning using scores
+├── logs_pruning.log             # Execution logs
+├── results/                     # Directory for output CSVs and PNGs (Mounted to container)
+└── README.md                    # This file
+```
 
-### Key Features
+## 🛠️ Prerequisites
 
-- **Causal Importance Scoring**: Implementation of activation patching and causal masking techniques
-- **Multi-Metric Comparison**: Correlational, gradient-based, and causal importance metrics
-- **Comprehensive Validation**: Extensive testing on Japanese and multilingual datasets
-- **Scalable Architecture**: Support for various model sizes and architectures
-- **Reproducible Results**: Containerized environment with exact dependency specifications
-- **Visualization Suite**: Rich plotting and analysis tools for result interpretation
+To replicate the experiments, you need a machine with NVIDIA GPUs and the following software installed:
+
+* **Docker Engine**
+* **NVIDIA Container Toolkit** (required for `--gpus all`)
 
 ## 🚀 Quick Start
 
-### Using Docker (Recommended)
-
-```bash
-# Clone the repository
-git clone <repository-url>
-cd causal-transformer-compression
-
-# Quick demo (5-10 minutes)
-docker-compose up demo
-
-# Standard evaluation (30-60 minutes)
-docker-compose up standard
-
-# Full comprehensive evaluation (2-4 hours)
-docker-compose up full
-```
-
-### Manual Installation
-
-```bash
-# Create virtual environment
-python3.10 -m venv causal_env
-source causal_env/bin/activate  # On Windows: causal_env\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run demo
-python causal_pruning_implementation_fixed.py --mode demo
-```
-
-## 📋 Requirements
-
-### System Requirements
-- Python 3.10 or higher
-- 8GB+ RAM (16GB+ recommended for full evaluation)
-- 10GB+ disk space
-- Optional: CUDA-compatible GPU for acceleration
-
-### Key Dependencies
-- PyTorch 2.0+
-- Transformer Lens 1.17+
-- Transformers 4.35+
-- Datasets 2.14+
-- Japanese text processing libraries (fugashi, unidic-lite)
-
-## 🏗️ Architecture
-
-### Core Components
-
-1. **Importance Calculators**
-   - `CausalImportanceCalculator`: Activation patching implementation
-   - `CorrelationalImportanceCalculator`: Weight magnitude analysis
-   - `GradientImportanceCalculator`: Gradient-based relevance
-
-2. **Pruning Engine**
-   - Structured pruning for attention heads and MLP layers
-   - Multiple sparsity level support (10%, 25%, 50%, 80%)
-   - Performance preservation analysis
-
-3. **Validation Framework**
-   - Hypothesis testing for importance metrics
-   - Cross-dataset generalization analysis
-   - Statistical significance testing
-
-4. **Visualization Suite**
-   - Importance distribution heatmaps
-   - Performance degradation curves
-   - Correlation analysis plots
-
-### File Structure
-
-```
-causal-transformer-compression/
-├── causal_pruning_implementation_fixed.py  # Main implementation
-├── causal_pruning_execution.sh            # Execution script
-├── demo_causal_pruning.py                 # Quick validation demo
-├── setup_and_run_fixed.py                # Environment setup
-├── config/                                # Configuration files
-├── results/                              # Output directory
-├── logs/                                 # Execution logs
-├── docker/                               # Docker configurations
-│   ├── Dockerfile
-│   ├── docker-compose.yml
-│   └── .dockerignore
-└── docs/                                 # Documentation
-```
-
-## 🔬 Usage Examples
-
-### Basic Usage
-
-```python
-from causal_pruning_implementation_fixed import CausalPruningFramework
-
-# Initialize framework
-framework = CausalPruningFramework(
-    model_name="ruri-ai/ruri-v2",
-    max_datasets=5,
-    quick_mode=True
-)
-
-# Run comprehensive evaluation
-results = framework.run_comprehensive_evaluation()
-
-# Generate visualizations
-framework.create_visualizations(results)
-```
-
-### Advanced Configuration
-
-```python
-# Custom configuration
-config = {
-    "sparsity_levels": [0.1, 0.25, 0.5, 0.8],
-    "importance_methods": ["causal", "correlational", "gradient"],
-    "datasets": ["jsts", "jcola", "marc_ja"],
-    "num_samples": 100,
-    "batch_size": 16
-}
-
-framework = CausalPruningFramework(**config)
-results = framework.run_evaluation()
-```
-
-### Docker Deployment
-
-```bash
-# Build custom image
-docker build -t my-causal-pruning .
-
-# Run with custom configuration
-docker run -v $(pwd)/config.json:/app/config.json \
-           -v $(pwd)/results:/app/results \
-           my-causal-pruning \
-           python causal_pruning_implementation_fixed.py --config /app/config.json
-
-# Interactive development
-docker-compose up interactive
-```
-
-## 📊 Results and Validation
-
-### Key Findings
-
-1. **Causal Superiority**: Causal importance metrics demonstrate superior performance retention at high sparsity levels (>25%)
-2. **Performance Crossover**: Causal methods show 2.65× better performance at 80% sparsity
-3. **Robustness**: Consistent results across multiple Japanese language tasks
-4. **Scalability**: Framework validated on models up to 7B parameters
-
-### Output Files
-
-- `pruning_results.csv`: Quantitative performance metrics
-- `hypothesis1_validation.png`: Importance-performance correlation
-- `hypothesis2_validation.png`: Sparsity-performance curves
-- `importance_heatmaps.png`: Layer-wise importance distribution
-- `comprehensive_results_summary.md`: Detailed analysis report
-
-## 🔧 Configuration
-
-### Environment Variables
-
-```bash
-# Performance tuning
-export OMP_NUM_THREADS=4
-export TOKENIZERS_PARALLELISM=false
-
-# Memory optimization
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
-
-# Logging
-export LOGLEVEL=INFO
-```
-
-### Configuration File (config.json)
-
-```json
-{
-  "model_settings": {
-    "model_name": "ruri-ai/ruri-v2",
-    "max_length": 512,
-    "device": "auto"
-  },
-  "evaluation_settings": {
-    "sparsity_levels": [0.1, 0.25, 0.5, 0.8],
-    "num_samples": 100,
-    "batch_size": 16
-  },
-  "dataset_settings": {
-    "max_datasets": 10,
-    "include_jsts": true,
-    "include_multilingual": true
-  },
-  "output_settings": {
-    "save_intermediate": true,
-    "generate_plots": true,
-    "verbose": true
-  }
-}
-```
-
-## 🧪 Testing
-
-### Running Tests
-
-```bash
-# Unit tests
-pytest tests/ -v
-
-# Integration tests
-pytest tests/integration/ -v
-
-# Performance benchmarks
-pytest tests/benchmarks/ -v --benchmark-only
-
-# Coverage report
-pytest --cov=causal_pruning --cov-report=html
-```
-
-### Validation Checklist
-
-- [ ] Environment setup successful
-- [ ] Model loading functional
-- [ ] Dataset access working
-- [ ] Importance calculation accurate
-- [ ] Pruning mechanism operational
-- [ ] Visualization generation successful
-- [ ] Results reproducible
-
-## 📈 Performance Optimization
-
-### Memory Optimization
-
-```python
-# Gradient checkpointing
-model.gradient_checkpointing_enable()
-
-# Mixed precision
-from torch.cuda.amp import autocast
-with autocast():
-    outputs = model(**inputs)
-
-# Batch size adjustment
-optimal_batch_size = find_optimal_batch_size(model, dataset)
-```
-
-### Speed Optimization
-
-```python
-# Parallel processing
-from torch.nn import DataParallel
-model = DataParallel(model)
-
-# Compiled models (PyTorch 2.0+)
-model = torch.compile(model)
-
-# Efficient data loading
-dataloader = DataLoader(dataset, num_workers=4, pin_memory=True)
-```
-
-## 🤝 Contributing
-
-### Development Setup
-
-```bash
-# Clone repository
-git clone <repository-url>
-cd causal-transformer-compression
-
-# Install development dependencies
-pip install -r requirements.txt -r requirements-dev.txt
-
-# Install pre-commit hooks
-pre-commit install
-
-# Run development server
-python -m http.server 8000
-```
-
-### Code Quality
-
-```bash
-# Format code
-black .
-isort .
-
-# Type checking
-mypy causal_pruning_implementation_fixed.py
-
-# Linting
-flake8 .
-
-# Security check
-bandit -r .
-```
-
-### Contribution Guidelines
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit changes (`git commit -m 'Add amazing feature'`)
-4. Push to branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📚 Documentation
-
-### API Documentation
-
-```bash
-# Generate documentation
-sphinx-build -b html docs/ docs/_build/html
-
-# Serve locally
-python -m http.server 8080 --directory docs/_build/html
-```
-
-### Jupyter Notebooks
-
-Interactive examples and tutorials are available in the `notebooks/` directory:
-
-- `01_quick_start.ipynb`: Basic usage examples
-- `02_advanced_configuration.ipynb`: Custom setups
-- `03_analysis_examples.ipynb`: Result interpretation
-- `04_extension_guide.ipynb`: Framework extension
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-1. **Memory Errors**
-   ```bash
-   # Reduce batch size or enable gradient checkpointing
-   export BATCH_SIZE=8
-   export GRADIENT_CHECKPOINTING=true
-   ```
-
-2. **Japanese Text Processing**
-   ```bash
-   # Install additional dependencies
-   pip install fugashi unidic-lite
-   python -m unidic download
-   ```
-
-3. **CUDA Issues**
-   ```bash
-   # Check CUDA availability
-   python -c "import torch; print(torch.cuda.is_available())"
-   
-   # Force CPU mode
-   export CUDA_VISIBLE_DEVICES=""
-   ```
-
-4. **Dataset Access**
-   ```bash
-   # Login to Hugging Face
-   huggingface-cli login
-   
-   # Clear cache
-   rm -rf ~/.cache/huggingface/
-   ```
-
-### Support
-
-- 📧 Email: [support@example.com]
-- 💬 Discord: [Community Server]
-- 🐛 Issues: [GitHub Issues](https://github.com/example/causal-transformer-compression/issues)
-- 📖 Wiki: [Project Wiki](https://github.com/example/causal-transformer-compression/wiki)
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- Transformer Lens team for the excellent library
-- Hugging Face for model and dataset infrastructure
-- Research community for theoretical foundations
-- Contributors and beta testers
-
-## 📊 Citation
-
-If you use this framework in your research, please cite:
+The entire pipeline (environment build, scoring, pruning, and visualization) is automated via the shell script.
+
+1.  **Clone the repository:**
+    ```bash
+    git clone <your-repo-url>
+    cd <repo-name>
+    ```
+
+2.  **Run the reproduction script:**
+    ```bash
+    bash casual_pruning_execution.sh
+    ```
+
+### What the script does:
+1.  Builds the Docker image `causal-pruning` using `Dockerfile_CWP`.
+2.  **Phase 1 (CC-Prune):**
+    * Runs `casual_active_scoring.py` to generate causal importance scores.
+    * Runs `casual_active_pruning.py` to prune the model while protecting the circuit.
+    * Runs `casual_active_visualize.py` to generate figures.
+3.  **Phase 2 (Wanda Baseline):**
+    * Runs `casual_wanda_scoring.py` to calculate Wanda metrics.
+    * Runs `casual_wanda_pruning.py` for comparison.
+4.  Automatically cleans up containers and images after execution.
+
+*Note: By default, the script uses GPU 0 (`CUDA_VISIBLE_DEVICES="0"`). Modify `casual_pruning_execution.sh` if you need to use different GPUs.*
+
+## 🔬 Experiment Pipeline
+
+The experiments consist of sequential stages. **Scoring must be executed before Pruning** for both methods.
+
+### 1. Causal Circuit-Guided Pruning (CC-Prune)
+
+* **Step 1: Scoring**
+    * **Script:** `casual_active_scoring.py`
+    * **Description:** Calculates the causal importance of each neuron/head using Activation Patching on the JSTS dataset. Saves scores to `causal_scores_*.csv`.
+* **Step 2: Pruning**
+    * **Script:** `casual_active_pruning.py`
+    * **Description:** Loads the CSV from Step 1, identifies the "Causal Circuit" (top $k$% important components), and prunes the rest using magnitude pruning.
+* **Step 3: Visualization**
+    * **Script:** `casual_active_visualize.py`
+    * **Description:** Generates heatmaps (e.g., `protection_L3_H5.png`) proving that specific weights are protected.
+
+### 2. Baseline Comparison (Wanda)
+
+* **Step 1: Scoring**
+    * **Script:** `casual_wanda_scoring.py`
+    * **Description:** Calculates importance metrics based on Weights $\times$ Activation Norms.
+* **Step 2: Pruning**
+    * **Script:** `casual_wanda_pruning.py`
+    * **Description:** Loads the Wanda scores and performs pruning to provide a baseline for performance comparison.
+
+## 📊 Results
+
+All experimental results, including CSV logs and generated figures, will be saved in the `./results` directory.
+
+Key outputs include:
+* `causal_scores_*.csv`: Raw importance scores for all components (Generated by scoring step).
+* `hybrid_pruning_results_*.csv`: Performance metrics of CC-Prune at various sparsity levels.
+* `wanda_pruning_results_*.csv`: Performance metrics of Wanda pruning.
+* `weight_changes_L*.png`: Visual comparison of weight matrices before/after pruning.
+* `protection_L*_H*.png`: Proof of circuit protection mechanism.
+
+## 📝 Citation
+
+If you use this code or findings in your research, please cite our paper:
 
 ```bibtex
-@article{causal_transformer_compression_2024,
-  title={Causal Intervention-Based Structural Compression of Transformers: A Theoretical Framework for Overcoming Spurious Correlations in Neural Network Pruning},
-  author={Research Team},
-  journal={arXiv preprint arXiv:2024.xxxxx},
-  year={2024}
+@article{CCPrune2025,
+  title={Causal Circuit-Guided Pruning: A Principled Framework for Functionality-Preserving Compression of Transformers},
+  author={Anonymous Author(s)},
+  journal={Preprint},
+  year={2025}
 }
 ```
 
 ---
+*Note: The filenames in this repository use "casual" for historical consistency, but the methodology refers to "Causal" (Cause-and-Effect).*
 
-**Built with ❤️  for the research community**
-
-*Last updated: October 2025*
