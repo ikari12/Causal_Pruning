@@ -6,6 +6,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
+import shutil
 from pathlib import Path
 
 # ============================================================================
@@ -43,7 +44,18 @@ def run_full_neuron_analysis():
     
     # --- Setup ---
     print("Setting up model and data...")
-    Path(RESULTS_DIR).mkdir(exist_ok=True)
+    results_path = Path(RESULTS_DIR)
+    if results_path.exists():
+        print(f"🧹 Cleaning up existing results in {RESULTS_DIR}...")
+        try:
+            shutil.rmtree(results_path)
+        except OSError:
+            for item in results_path.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+    results_path.mkdir(parents=True, exist_ok=True)
     model = AutoModel.from_pretrained(MODEL_NAME).to(DEVICE)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     

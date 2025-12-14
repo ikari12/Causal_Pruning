@@ -5,7 +5,7 @@ from transformers import AutoModel, AutoTokenizer
 import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
-from mteb import MTEB
+from mteb import MTEB, get_tasks
 import time
 
 # ============================================================================
@@ -97,10 +97,28 @@ def evaluate_model(model_to_eval, tokenizer_to_use, sparsity_level):
         def __init__(self, model, tokenizer):
             self.model = model
             self.tokenizer = tokenizer
+        
         def encode(self, sentences, batch_size=32, **kwargs):
             all_embeddings = []
-            for i in range(0, len(sentences), batch_size):
-                batch = sentences[i:i+batch_size]
+            
+            if isinstance(sentences, torch.utils.data.DataLoader):
+                iterator = sentences
+            else:
+                iterator = [sentences[i:i+batch_size] for i in range(0, len(sentences), batch_size)]
+
+            for batch in iterator:
+                if isinstance(batch, dict):
+                    batch = list(batch.values())[0]
+                
+                if isinstance(batch, tuple):
+                    batch = list(batch)
+                
+                if isinstance(batch, torch.Tensor):
+                    batch = batch.tolist()
+
+                if hasattr(batch, 'tolist'):
+                    batch = batch.tolist()
+
                 inputs = self.tokenizer(batch, padding=True, truncation=True, return_tensors='pt', max_length=512)
                 inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
                 with torch.no_grad():
@@ -109,18 +127,26 @@ def evaluate_model(model_to_eval, tokenizer_to_use, sparsity_level):
                     mask = inputs['attention_mask'].unsqueeze(-1)
                     sum_hidden = torch.sum(last_hidden * mask, dim=1)
                     sum_mask = torch.sum(mask, dim=1)
+                    sum_mask = torch.clamp(sum_mask, min=1e-9)
                     embeddings = sum_hidden / sum_mask
                 all_embeddings.append(embeddings.cpu())
             return torch.cat(all_embeddings)
 
     model_for_eval = ModelWrapper(model_to_eval, tokenizer_to_use)
-    evaluation = MTEB(tasks=["JSTS"], task_langs=["ja"])
+    
+    tasks = get_tasks(tasks=["JSTS"], languages=["jpn"])
+    evaluation = MTEB(tasks=tasks)
+    
     results = evaluation.run(
         model_for_eval, 
         output_folder=f"{RESULTS_DIR}/JSTS_pruned_{sparsity_level*100:.0f}percent", 
         eval_splits=["validation"],
+        encode_kwargs={"batch_size": 32} 
     )
+    pearson_score = results[0].scores["validation"][0]["pearson"]
     print(f"--- ✅ Evaluation Complete for {sparsity_level*100:.0f}% ---")
+    print(f"✅ JSTS Pearson Score for NeuronCausalPruning: {pearson_score:.4f}")
+
     pearson_score = results[0].scores['validation'][0]['pearson']
     return pearson_score
 

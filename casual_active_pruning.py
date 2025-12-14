@@ -8,7 +8,7 @@ import copy
 from transformers import AutoModel, AutoTokenizer
 import pandas as pd
 from pathlib import Path
-from mteb import MTEB
+from mteb import MTEB, get_tasks # get_tasks を追加
 import time
 import numpy as np
 import torch.nn.functional as F
@@ -92,20 +92,10 @@ def hybrid_prune_model(model: nn.Module, summary_df: pd.DataFrame, target_sparsi
             head_start_idx = head * d_head
             head_end_idx = (head + 1) * d_head
 
-            # Rationale: To preserve the function of a neuron (H, D), we must protect:
-            # 1. Output path (W_O at dimension level).
-            # 2. Input Value (W_V, B_V at dimension level).
-            # 3. Attention Pattern (W_Q, B_Q, W_K, B_K at head level).
-
-            # ▼▼▼ FIX: Comprehensive Causal Circuit Protection for Attention ▼▼▼
-            
             # 1. Protect W_O (Output projection) - Column
             w_o_name = f"encoder.layer.{layer}.attention.output.dense.weight"
             if w_o_name in protection_mask and neuron_idx < protection_mask[w_o_name].shape[1]:
                 protection_mask[w_o_name][:, neuron_idx] = False
-            # Note: B_O (output bias) is typically protected entirely or pruned based on overall magnitude, 
-            # as it affects the entire layer output, not just this specific head/neuron. 
-            # We rely on magnitude pruning to handle B_O if it's not crucial overall.
 
             # 2. Protect W_V and B_V (Value projection) - Row/Element (Neuron level)
             w_v_name = f"encoder.layer.{layer}.attention.self.value.weight"
@@ -126,12 +116,10 @@ def hybrid_prune_model(model: nn.Module, summary_df: pd.DataFrame, target_sparsi
                 # Protect Bias
                 if b_proj_name in protection_mask and head_end_idx <= protection_mask[b_proj_name].shape[0]:
                     protection_mask[b_proj_name][head_start_idx:head_end_idx] = False
-            # ▲▲▲ END FIX ▲▲▲
         
         elif n_type == 'FFN':
             dim = neuron['dim'] # Index corresponding to the neuron
 
-            # ▼▼▼ FIX: Protect FFN Weights and Biases ▼▼▼
             # 1. Protect W_in (intermediate.dense) and B_in
             w_in_name = f"encoder.layer.{layer}.intermediate.dense.weight"
             b_in_name = f"encoder.layer.{layer}.intermediate.dense.bias"
@@ -147,7 +135,6 @@ def hybrid_prune_model(model: nn.Module, summary_df: pd.DataFrame, target_sparsi
             # Protect the column corresponding to the neuron output
             if w_out_name in protection_mask and dim < protection_mask[w_out_name].shape[1]:
                 protection_mask[w_out_name][:, dim] = False
-            # ▲▲▲ END FIX ▲▲▲
 
     # Phase 2: Hybrid Pruning
     prunable_params = []
@@ -215,7 +202,7 @@ def hybrid_prune_model(model: nn.Module, summary_df: pd.DataFrame, target_sparsi
     return model
 
 # ============================================================================
-# 4. Evaluation Function (No major changes needed here, assuming it works reliably)
+# 4. Evaluation Function
 # ============================================================================
 def evaluate_model(model_to_eval: nn.Module, tokenizer_to_use):
     """
@@ -240,8 +227,24 @@ def evaluate_model(model_to_eval: nn.Module, tokenizer_to_use):
         def encode(self, sentences, batch_size=32, **kwargs):
             self.model.eval()
             all_embeddings = []
-            for i in range(0, len(sentences), batch_size):
-                batch = sentences[i:i+batch_size]
+            
+            # ▼▼▼ FIX: Handle DataLoader or List input for MTEB v1.x Compatibility ▼▼▼
+            if isinstance(sentences, torch.utils.data.DataLoader):
+                iterator = sentences
+            else:
+                iterator = [sentences[i:i+batch_size] for i in range(0, len(sentences), batch_size)]
+
+            for batch in iterator:
+                # Normalize input types (dict/tuple/tensor -> list of strings)
+                if isinstance(batch, dict):
+                    batch = list(batch.values())[0]
+                if isinstance(batch, tuple):
+                    batch = list(batch)
+                if hasattr(batch, 'tolist'):
+                    batch = batch.tolist()
+                if not isinstance(batch, list):
+                    batch = [batch]
+
                 inputs = self.tokenizer(
                     batch, padding=True, truncation=True, return_tensors="pt", max_length=512
                 ).to(self.model.device)
@@ -252,22 +255,34 @@ def evaluate_model(model_to_eval: nn.Module, tokenizer_to_use):
                 all_embeddings.append(normalized_embeddings.cpu())
 
             return torch.cat(all_embeddings, dim=0)
+            # ▲▲▲ END FIX ▲▲▲
 
     mteb_model = MTEBWrapper(model=model_to_eval, tokenizer=tokenizer_to_use)
     import warnings
     warnings.filterwarnings("ignore", category=UserWarning)
     
-    evaluation = MTEB(tasks=["JSTS"], task_langs=["ja"])
+    # ▼▼▼ FIX: Correct MTEB initialization ▼▼▼
+    tasks = get_tasks(tasks=["JSTS"], languages=["jpn"])
+    evaluation = MTEB(tasks=tasks)
+    # ▲▲▲ END FIX ▲▲▲
     
     output_folder_path = Path(RESULTS_DIR) / f"jsts_results_ccprune_{int(time.time())}"
     
-    results = evaluation.run(mteb_model, output_folder=str(output_folder_path), verbosity=1, eval_splits=["validation"])
+    # Pass batch_size via encode_kwargs
+    results = evaluation.run(
+        mteb_model, 
+        output_folder=str(output_folder_path), 
+        verbosity=1, 
+        eval_splits=["validation"],
+        encode_kwargs={"batch_size": 32}
+    )
     
     end_time = time.time()
     print(f"✅ Evaluation finished in {end_time - start_time:.2f} seconds.")
     
     try:
         pearson_score = results[0].scores["validation"][0]["pearson"]
+        print("✅ JSTS Pearson Score:", pearson_score)
         return pearson_score
     except (KeyError, TypeError, IndexError) as e:
         print(f"⚠️ Could not extract Pearson score. Error: {e}")
@@ -287,7 +302,7 @@ if __name__ == "__main__":
     print("✅ Causal score data loaded.")
 
     CIRCUIT_RETENTION_RATIO = 0.3
-    TARGET_SPARSITY_LEVELS = [i / 100.0 for i in range(101)]
+    TARGET_SPARSITY_LEVELS = [i / 10.0 for i in range(10)]
     performance_results = []
     
     print("Loading original model and tokenizer...")
@@ -331,3 +346,4 @@ if __name__ == "__main__":
     results_df = pd.DataFrame(performance_results)
     print(results_df.to_string(index=False))
     results_df.to_csv(Path(RESULTS_DIR) / f"hybrid_pruning_results_{sane_model_name}.csv", index=False)
+

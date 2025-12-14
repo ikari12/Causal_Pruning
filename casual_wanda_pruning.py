@@ -1,11 +1,11 @@
 # FILE: causal_wanda_pruning_experiment_fixed.py
-# PURPOSE: To run pruning experiments with corrected evaluation caching.
+# PURPOSE: To run pruning experiments with corrected evaluation caching and MTEB compatibility.
 
 import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
 from pathlib import Path
-from mteb import MTEB
+from mteb import MTEB, get_tasks
 import torch.nn.functional as F
 import warnings
 import copy
@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # --- Configuration ---
 MODEL_ID = "cl-nagoya/ruri-base-v2"
 RESULTS_DIR = Path("/app/results/")
-TARGET_SPARSITY_LEVELS = [i / 100.0 for i in range(101)]
+TARGET_SPARSITY_LEVELS = [i / 10.0 for i in range(10)]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # --- End of Configuration ---
 
@@ -40,15 +40,36 @@ class MTEBWrapper:
     def encode(self, sentences, batch_size=32, **kwargs):
         self.model.eval()
         all_embeddings = []
-        for i in range(0, len(sentences), batch_size):
-            batch = sentences[i:i + batch_size]
+
+        # --- FIX: Handle both DataLoader (MTEB v1.x) and List inputs ---
+        if isinstance(sentences, torch.utils.data.DataLoader):
+            # If it's a DataLoader, it yields batches directly
+            iterator = sentences
+        else:
+            # If it's a list, manually slice it into batches
+            iterator = [sentences[i:i + batch_size] for i in range(0, len(sentences), batch_size)]
+
+        for batch in iterator:
+            # --- FIX: Normalize input types (dict/tuple/tensor -> list of strings) ---
+            if isinstance(batch, dict):
+                batch = list(batch.values())[0]
+            if isinstance(batch, tuple):
+                batch = list(batch)
+            if hasattr(batch, 'tolist'):
+                batch = batch.tolist()
+            if not isinstance(batch, list):
+                batch = [batch]
+
+            # Tokenize and Encode
             inputs = self.tokenizer(
                 batch, padding=True, truncation=True, return_tensors="pt", max_length=512
             ).to(self.model.device)
+            
             model_output = self.model(**inputs)
             pooled = self._mean_pooling(model_output, inputs['attention_mask'])
             normalised_embeddings = F.normalize(pooled, p=2, dim=1)
             all_embeddings.append(normalised_embeddings.cpu())
+            
         return torch.cat(all_embeddings, dim=0)
 
 
@@ -56,13 +77,23 @@ def evaluate_model_on_jsts(model, tokenizer, description):
     """Evaluates a given model on the JSTS benchmark."""
     print(f"\n🚀 Evaluating {description} on JSTS...")
     mteb_model = MTEBWrapper(model=model, tokenizer=tokenizer)
-    evaluation = MTEB(tasks=["JSTS"], task_langs=["ja"])
+    
+    # Use explicit ISO code "jpn" for MTEB v1.x compliance
+    tasks = get_tasks(tasks=["JSTS"], languages=["jpn"])
+    evaluation = MTEB(tasks=tasks)
     
     safe_desc = re.sub(r'[^a-zA-Z0-9_-]', '_', description)
     output_path = RESULTS_DIR / f"jsts_eval_{safe_desc}"
     print(f"Using unique output folder to prevent caching: {output_path}")
     
-    results = evaluation.run(mteb_model, output_folder=output_path, verbosity=0, eval_splits=["validation"])
+    # Pass batch_size via encode_kwargs to control MTEB batching
+    results = evaluation.run(
+        mteb_model, 
+        output_folder=output_path, 
+        verbosity=0, 
+        eval_splits=["validation"],
+        encode_kwargs={"batch_size": 32}
+    )
     
     pearson_score = results[0].scores["validation"][0]["pearson"]
     print(f"✅ JSTS Pearson Score for {description}: {pearson_score:.4f}")
