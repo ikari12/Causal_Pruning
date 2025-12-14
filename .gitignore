@@ -1,0 +1,17 @@
+# .gitignore
+
+# Python cache
+__pycache__/
+*.pyc
+
+results/
+results_*/
+pruning_results/
+*.log
+*.csv
+*.png
+
+.dockerignore
+
+# System
+.DS_Store
